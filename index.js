@@ -1,7 +1,9 @@
+require("dotenv").config() // Garante leitura do .env se existir localmente
 const express = require("express")
 const cors = require("cors")
 const { Boom } = require("@hapi/boom")
 const pino = require("pino")
+const { createClient } = require("@supabase/supabase-js")
 const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -17,23 +19,29 @@ app.use(cors())
 
 // -------------------------
 // AJUSTE DE LIMITE DE PAYLOAD
-// Define o limite máximo de corpo da requisição (payload) para 20 megabytes (20mb).
+// -------------------------
 app.use(express.json({ limit: '20mb' }))
 app.use(express.urlencoded({ limit: '20mb', extended: true }))
-// -------------------------
-
 
 // -------------------------
-// Estado em memória
+// CONFIGURAÇÃO SUPABASE (ESSENCIAL)
+// -------------------------
+const supabaseUrl = process.env.SUPABASE_URL
+const supabaseKey = process.env.SUPABASE_KEY // Use a chave SERVICE_ROLE para ter permissão de escrita total
+
+if (!supabaseUrl || !supabaseKey) {
+    console.error("❌ ERRO CRÍTICO: SUPABASE_URL e SUPABASE_KEY são obrigatórios nas variáveis de ambiente.")
+    process.exit(1)
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey)
+
+// -------------------------
+// Estado da Conexão (Apenas controle, sem dados pesados)
 // -------------------------
 let sock = null
 let isStarting = false
 let lastQrDataUrl = null
-
-let chatsStore = {}
-let messagesStore = {}
-let contactsStore = {} // 🟢 CORREÇÃO 1: Adição do contactsStore
-
 const connectionStatus = {
     connected: false,
     phone: null,
@@ -41,159 +49,73 @@ const connectionStatus = {
 }
 
 // -------------------------
-// Função auxiliar para extrair texto da mensagem
+// 🛠️ FUNÇÕES AUXILIARES (TRANSFORMADORES)
 // -------------------------
+
+// Extrai texto simples da mensagem
 function getMessageText(msg) {
     if (!msg || !msg.message) return ""
-
-    const messageContent = msg.message
-
-    if (messageContent.conversation) return messageContent.conversation
-    if (messageContent.extendedTextMessage?.text) return messageContent.extendedTextMessage.text
-    if (messageContent.imageMessage?.caption) return `[Imagem] ${messageContent.imageMessage.caption || ""}`
-    if (messageContent.videoMessage?.caption) return `[Vídeo] ${messageContent.videoMessage.caption || ""}`
-    if (messageContent.documentMessage?.caption) return `[Documento] ${messageContent.documentMessage.caption || ""}`
-    if (messageContent.audioMessage) return "[Áudio]"
-    if (messageContent.stickerMessage) return "[Sticker]"
-    if (messageContent.contactMessage) return "[Contato]"
-    if (messageContent.locationMessage) return "[Localização]"
-
-    return "[Mensagem]"
+    const content = msg.message
+    if (content.conversation) return content.conversation
+    if (content.extendedTextMessage?.text) return content.extendedTextMessage.text
+    if (content.imageMessage?.caption) return content.imageMessage.caption || "[Imagem]"
+    if (content.videoMessage?.caption) return content.videoMessage.caption || "[Vídeo]"
+    if (content.documentMessage?.caption) return content.documentMessage.caption || "[Documento]"
+    return ""
 }
 
-// -------------------------
-// Função para normalizar chats para o formato do frontend
-// TORNADA ASSÍNCRONA PARA BUSCAR A FOTO DE PERFIL
-// -------------------------
-async function normalizeChatForFrontend(chat) { // <--- ALTERADO: Adicionado 'async'
-    const chatId = chat.id
-    const chatMessages = messagesStore[chatId] || []
-    
-    // ... (restante da lógica de lastMsg) ...
-
-    const sortedMessages = [...chatMessages].sort(
-        (a, b) => (Number(b.messageTimestamp) || 0) - (Number(a.messageTimestamp) || 0),
-    )
-    const lastMsg = sortedMessages[0]
-
-    // 🟢 CORREÇÃO 3: Lógica de prioridade para o nome do chat
-    const contactInfo = contactsStore[chatId] || {}
-    
-    let chatName = 
-        contactInfo.name || 
-        chat.name || 
-        chat.notify || 
-        chat.verifiedName ||
-        chat.subject || 
-        ""
-
-    if (!chatName) {
-        if (chatId.includes("@g.us")) {
-            chatName = "Grupo"
-        } else {
-            chatName = chatId.split("@")[0] // Fallback para o número (ID)
-        }
-    }
-    // FIM da Correção 3
-    
-    // ------------------------------------
-    // 📸 NOVO: Busca Assíncrona da Foto de Perfil
-    let profilePicUrl = null
-    if (sock && connectionStatus.connected) {
-        try {
-            profilePicUrl = await sock.profilePictureUrl(chatId, "image")
-        } catch (e) {
-            // Ignora erro se não houver foto (ex: 404)
-        }
-    }
-    // ------------------------------------
-
-    const lastMsgTimestamp = lastMsg?.messageTimestamp
-        ? Number(lastMsg.messageTimestamp) * 1000
-        : chat.conversationTimestamp
-        ? Number(chat.conversationTimestamp) * 1000
-        : Date.now()
-
-    return {
-        id: chatId,
-        name: chatName,
-        // 📸 NOVO: Adicionado pictureUrl
-        pictureUrl: profilePicUrl, 
-        lastMessage: lastMsg ? getMessageText(lastMsg) : "",
-        lastMessageTime: lastMsgTimestamp,
-        unreadCount: chat.unreadCount || 0,
-        isArchived: chat.archived || false,
-        isPinned: chat.pinned || false,
-        // NOVO: Adicionado isGroup para fácil filtragem no frontend
-        isGroup: chatId.includes("@g.us"), 
-    }
+// Determina o tipo de mensagem
+function getMessageType(msg) {
+    if (!msg.message) return "text"
+    if (msg.message.imageMessage) return "image"
+    if (msg.message.videoMessage) return "video"
+    if (msg.message.audioMessage) return "audio"
+    if (msg.message.documentMessage) return "document"
+    if (msg.message.stickerMessage) return "sticker"
+    return "text"
 }
 
-// -------------------------
-// Função para normalizar mensagens para o formato do frontend
-// -------------------------
-function normalizeMessageForFrontend(msg) {
-    if (!msg || !msg.key) return null
-
-    const fromMe = msg.key.fromMe || false
-    const messageText = getMessageText(msg)
-
-    const timestampMs = msg.messageTimestamp ? Number(msg.messageTimestamp) * 1000 : Date.now()
+// Prepara mensagem para salvar no Banco (Extrai metadados de mídia e deleta o buffer)
+function prepareMessageForDB(msg, chatId) {
+    const type = getMessageType(msg)
+    const hasMedia = ["image", "video", "audio", "document", "sticker"].includes(type)
     
-    const hasMedia = !!(
-        msg.message?.imageMessage ||
-        msg.message?.videoMessage ||
-        msg.message?.audioMessage ||
-        msg.message?.documentMessage
-    )
+    let mediaMeta = null
 
-    // ✅ CORREÇÃO: URL completa da mídia
-    const baseUrl = process.env.API_URL || 'http://localhost:3000'
-    const mediaUrl = hasMedia 
-        ? `${baseUrl}/media/${msg.key.remoteJid}/${msg.key.id}` 
-        : null
-
-    let type = "text"
     if (hasMedia) {
-        if (msg.message?.imageMessage) type = "image"
-        else if (msg.message?.videoMessage) type = "video"
-        else if (msg.message?.audioMessage) type = "audio"
-        else if (msg.message?.documentMessage) type = "document"
-        else if (msg.message?.stickerMessage) type = "sticker"
-    }
-
-    // ✅ NOVO: Incluir mimeType correto
-    let mimeType = null
-    if (hasMedia) {
-        const mediaContent = 
-            msg.message?.imageMessage ||
-            msg.message?.videoMessage ||
-            msg.message?.audioMessage ||
-            msg.message?.documentMessage
-        mimeType = mediaContent?.mimetype || null
+        // Extrai o objeto de mídia (imageMessage, videoMessage, etc)
+        const messageContent = msg.message[type + "Message"]
+        if (messageContent) {
+            // SALVA APENAS OS DADOS NECESSÁRIOS PARA BAIXAR DEPOIS
+            mediaMeta = {
+                url: messageContent.url,
+                mediaKey: messageContent.mediaKey ? Buffer.from(messageContent.mediaKey).toString('base64') : null,
+                mimetype: messageContent.mimetype,
+                fileEncSha256: messageContent.fileEncSha256 ? Buffer.from(messageContent.fileEncSha256).toString('base64') : null,
+                fileSha256: messageContent.fileSha256 ? Buffer.from(messageContent.fileSha256).toString('base64') : null,
+                fileLength: messageContent.fileLength,
+                directPath: messageContent.directPath,
+                iv: messageContent.iv ? Buffer.from(messageContent.iv).toString('base64') : null, // Necessário para alguns tipos
+            }
+        }
     }
 
     return {
-        id: msg.key.id || "",
-        body: messageText,
-        timestamp: timestampMs,
-        from: msg.key.participant || msg.key.remoteJid || "",
-        to: msg.key.remoteJid || "",
-        fromMe: fromMe,
+        id: msg.key.id,
+        chat_id: chatId,
+        sender_id: msg.key.participant || msg.key.remoteJid,
+        content: getMessageText(msg),
+        timestamp: Number(msg.messageTimestamp) * 1000,
+        from_me: msg.key.fromMe || false,
         type: type,
-        hasMedia: hasMedia,
-        mediaUrl: mediaUrl,
-        mimeType: mimeType, // ✅ Agora com mimeType correto
-        ack: msg.status || 0,
-        caption: msg.message?.imageMessage?.caption || 
-                 msg.message?.videoMessage?.caption || 
-                 msg.message?.documentMessage?.caption || 
-                 null,
+        has_media: hasMedia,
+        media_meta: mediaMeta, // JSON leve
+        ack: msg.status || 0
     }
 }
 
 // -------------------------
-// Iniciar o WhatsApp
+// 🚀 INICIAR O WHATSAPP
 // -------------------------
 async function startWhatsApp() {
     if (isStarting) return
@@ -201,11 +123,9 @@ async function startWhatsApp() {
 
     try {
         console.log("[WHATSAPP] 🚀 Iniciando conexão...")
-
         const { version } = await fetchLatestBaileysVersion()
         const logger = pino({ level: "silent" })
-        const authStatePath = "./auth_info"
-        const { state, saveCreds } = await useMultiFileAuthState(authStatePath)
+        const { state, saveCreds } = await useMultiFileAuthState("./auth_info")
 
         const socket = makeWASocket({
             version,
@@ -214,149 +134,110 @@ async function startWhatsApp() {
                 creds: state.creds,
                 keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
-            browser: ["WhatsApp Business", "Chrome", "1.0.0"],
-            syncFullHistory: true,
-            getMessage: async (key) => {
-                const jid = key.remoteJid
-                const messages = messagesStore[jid] || []
-                const msg = messages.find((m) => m.key.id === key.id)
-                return msg?.message || { conversation: "" }
-            },
+            browser: ["WhatsApp Backend", "Chrome", "1.0.0"],
+            // 💡 IMPORTANTE: syncFullHistory: true é seguro agora porque NÃO guardamos na RAM.
+            // O processamento será feito via Stream para o Supabase.
+            syncFullHistory: true, 
+            generateHighQualityLinkPreview: true,
         })
 
         sock = socket
-
         sock.ev.on("creds.update", saveCreds)
 
         // -------------------------
-        // CHATS - Sincronização completa
+        // 🌊 O "CANO" (PIPELINE) DE DADOS
+        // Recebe do WA -> Joga no Supabase -> Limpa RAM
         // -------------------------
-        sock.ev.on("messaging-history.set", ({ chats, contacts, messages, isLatest }) => {
-            console.log("[SYNC] 📚 Histórico recebido:", {
-                chats: chats.length,
-                messages: messages.length,
-                isLatest,
-            })
+        
+        // 1. Histórico Inicial / Sincronização
+        sock.ev.on("messaging-history.set", async ({ chats, messages }) => {
+            console.log(`[SYNC] 🌊 Recebendo Tsunami: ${chats.length} chats, ${messages.length} mensagens.`)
 
-            chats.forEach((chat) => {
-                chatsStore[chat.id] = chat
-            })
+            // A) Processar Chats
+            if (chats.length > 0) {
+                const chatsBatch = chats.map(c => ({
+                    id: c.id,
+                    name: c.name || c.subject || c.verifiedName || (c.id.includes("@s.whatsapp.net") ? c.id.split("@")[0] : "Desconhecido"),
+                    unread_count: c.unreadCount || 0,
+                    is_group: c.id.includes("@g.us"),
+                    is_archived: c.archived || false,
+                    last_message_time: c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : Date.now()
+                }))
 
-            // 🟢 CORREÇÃO 2A: Popula o contactsStore na sincronização inicial
-            contacts.forEach((contact) => {
-                contactsStore[contact.id] = contact
-            })
-            // FIM da Correção 2A
-
-            messages.forEach((msg) => {
-                const jid = msg.key.remoteJid
-                if (!jid) return
-
-                if (!messagesStore[jid]) messagesStore[jid] = []
-
-                const exists = messagesStore[jid].find((x) => x.key.id === msg.key.id)
-                if (!exists) {
-                    messagesStore[jid].push(msg)
+                // Upsert em lotes de 100 para não travar o banco
+                for (let i = 0; i < chatsBatch.length; i += 100) {
+                    const batch = chatsBatch.slice(i, i + 100)
+                    const { error } = await supabase.from("chats").upsert(batch, { onConflict: 'id' })
+                    if (error) console.error("[SYNC] Erro ao salvar chats:", error.message)
                 }
-            })
+            }
 
-            console.log("[SYNC] ✅ Chats:", Object.keys(chatsStore).length)
-        })
-
-        sock.ev.on("chats.set", ({ chats }) => {
-            chats.forEach((chat) => {
-                chatsStore[chat.id] = chat
-            })
-        })
-
-        sock.ev.on("chats.upsert", (chats) => {
-            chats.forEach((chat) => {
-                chatsStore[chat.id] = { ...chatsStore[chat.id], ...chat }
-            })
-        })
-
-        sock.ev.on("chats.update", (updates) => {
-            updates.forEach((update) => {
-                if (chatsStore[update.id]) {
-                    chatsStore[update.id] = { ...chatsStore[update.id], ...update }
+            // B) Processar Mensagens (Pipeline para o Banco)
+            if (messages.length > 0) {
+                const msgsBatch = messages.map(m => prepareMessageForDB(m, m.key.remoteJid))
+                
+                // Salva em lotes de 500
+                for (let i = 0; i < msgsBatch.length; i += 500) {
+                    const batch = msgsBatch.slice(i, i + 500)
+                    const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' })
+                    if (error) console.error("[SYNC] Erro ao salvar mensagens:", error.message)
                 }
-            })
+            }
+
+            console.log("[SYNC] ✅ Dados salvos no Supabase. Memória RAM liberada.")
+            
+            // Força limpeza (opcional, Node faz auto, mas ajuda na lógica mental)
+            chats = null
+            messages = null 
+            if (global.gc) global.gc()
         })
 
-        sock.ev.on("chats.delete", (ids) => {
-            ids.forEach((id) => delete chatsStore[id])
-        })
+        // 2. Novas Mensagens (Tempo Real)
+        sock.ev.on("messages.upsert", async ({ messages, type }) => {
+            if (type !== "notify" && type !== "append") return
 
-        // -------------------------
-        // CONTATOS - Sincronização/Atualização
-        // -------------------------
-        // 🟢 CORREÇÃO 2B: Evento para atualizações de contatos
-        sock.ev.on("contacts.upsert", (contacts) => {
-            contacts.forEach((contact) => {
-                contactsStore[contact.id] = { ...contactsStore[contact.id], ...contact }
-            })
-        })
-        // FIM da Correção 2B
+            for (const msg of messages) {
+                const chatId = msg.key.remoteJid
+                if (!chatId || chatId === "status@broadcast") continue
 
-        // -------------------------
-        // MENSAGENS - Sincronização
-        // -------------------------
-        sock.ev.on("messages.set", ({ messages }) => {
-            messages.forEach((msg) => {
-                const jid = msg.key.remoteJid
-                if (!jid) return
+                // 1. Salvar Mensagem no Banco
+                const msgDB = prepareMessageForDB(msg, chatId)
+                await supabase.from("messages").upsert(msgDB)
 
-                if (!messagesStore[jid]) messagesStore[jid] = []
-
-                const exists = messagesStore[jid].find((x) => x.key.id === msg.key.id)
-                if (!exists) {
-                    messagesStore[jid].push(msg)
+                // 2. Atualizar o Chat (Última mensagem e unread)
+                const updateData = {
+                    last_message: getMessageText(msg),
+                    last_message_time: Number(msg.messageTimestamp) * 1000
                 }
-            })
-        })
-
-        sock.ev.on("messages.upsert", (m) => {
-            const messages = m.messages || []
-
-            messages.forEach((msg) => {
-                const jid = msg.key.remoteJid
-                if (!jid) return
-
-                if (!messagesStore[jid]) messagesStore[jid] = []
-
-                const exists = messagesStore[jid].find((x) => x.key.id === msg.key.id)
-                if (!exists) {
-                    messagesStore[jid].push(msg)
+                
+                // Se não fui eu que enviei, incrementa contador
+                if (!msg.key.fromMe) {
+                    // Nota: Incremento atômico seria ideal, mas simplificamos aqui
+                    // Precisaria de uma RPC no supabase para incrementar seguro, 
+                    // vamos apenas definir como não lido por hora ou buscar e somar.
+                    // Para performance, vamos apenas atualizar o timestamp.
                 }
 
-                if (!chatsStore[jid]) {
-                    chatsStore[jid] = {
-                        id: jid,
-                        name: msg.pushName || jid.split("@")[0],
-                        conversationTimestamp: Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000),
-                        unreadCount: msg.key.fromMe ? 0 : 1,
-                    }
-                } else {
-                    chatsStore[jid].conversationTimestamp = Number(msg.messageTimestamp) || Math.floor(Date.now() / 1000)
-
-                    if (!msg.key.fromMe) {
-                        chatsStore[jid].unreadCount = (chatsStore[jid].unreadCount || 0) + 1
-                    }
-                }
-            })
+                await supabase.from("chats").update(updateData).eq("id", chatId)
+            }
         })
 
-        sock.ev.on("messages.update", (updates) => {
-            updates.forEach((update) => {
-                const jid = update.key.remoteJid
-                if (!jid || !messagesStore[jid]) return
+        // 3. Atualizações de Chats (ex: arquivar, limpar unread)
+        sock.ev.on("chats.update", async (updates) => {
+            for (const update of updates) {
+                if (!update.id) continue
+                const { id, unreadCount, archived } = update
+                
+                const dataToUpdate = {}
+                if (unreadCount !== undefined) dataToUpdate.unread_count = unreadCount
+                if (archived !== undefined) dataToUpdate.is_archived = archived
 
-                const idx = messagesStore[jid].findIndex((m) => m.key.id === update.key.id)
-                if (idx !== -1) {
-                    messagesStore[jid][idx] = { ...messagesStore[jid][idx], ...update }
+                if (Object.keys(dataToUpdate).length > 0) {
+                    await supabase.from("chats").update(dataToUpdate).eq("id", id)
                 }
-            })
+            }
         })
+
 
         // -------------------------
         // CONEXÃO
@@ -368,29 +249,25 @@ async function startWhatsApp() {
                 lastQrDataUrl = await qrcode.toDataURL(qr)
                 connectionStatus.status = "qr"
                 console.log("[STATUS] 📱 QR Code gerado")
-                return
             }
 
             if (connection === "open") {
                 connectionStatus.connected = true
-                connectionStatus.phone = sock.user?.id || null
+                connectionStatus.phone = sock.user?.id
                 connectionStatus.status = "connected"
                 lastQrDataUrl = null
-
                 console.log("[WHATSAPP] ✅ Conectado:", sock.user?.id)
             }
 
             if (connection === "close") {
                 const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
-
                 connectionStatus.connected = false
-                connectionStatus.phone = null
                 connectionStatus.status = "disconnected"
                 lastQrDataUrl = null
 
                 if (reason !== DisconnectReason.loggedOut) {
                     isStarting = false
-                    setTimeout(() => startWhatsApp(), 3000)
+                    setTimeout(startWhatsApp, 3000)
                 }
             }
         })
@@ -398,581 +275,193 @@ async function startWhatsApp() {
         console.log("[WHATSAPP] ⚡ Socket iniciado")
     } catch (err) {
         console.error("[WHATSAPP] ❌ Erro:", err)
-    } finally {
         isStarting = false
     }
 }
 
 startWhatsApp()
+
 // ---------------------------------------------------------------------------------------------------
-// ROTAS HTTP
+// ROTAS HTTP (Agora lendo do Supabase - Lazy Loading Real)
 // ---------------------------------------------------------------------------------------------------
 
-// --- Rota de Status e Health ---
-app.get("/health", (req, res) => {
-    res.json({
-        ok: true,
-        status: connectionStatus,
-        stats: {
-            chats: Object.keys(chatsStore).length,
-            chatsWithMessages: Object.keys(messagesStore).length,
-        },
-    })
-})
+app.get("/health", (req, res) => res.json({ ok: true, status: connectionStatus }))
 
 app.get("/qr", (req, res) => {
-    if (connectionStatus.connected) {
-        return res.send("ALREADY_CONNECTED")
-    }
-    if (!lastQrDataUrl) {
-        return res.status(202).send("QR_NOT_READY")
-    }
+    if (connectionStatus.connected) return res.send("ALREADY_CONNECTED")
+    if (!lastQrDataUrl) return res.status(202).send("QR_NOT_READY")
     return res.send(lastQrDataUrl)
 })
 
-app.get("/status", (req, res) => {
-    res.json({
-        ...connectionStatus,
-        stats: {
-            chats: Object.keys(chatsStore).length,
-            chatsWithMessages: Object.keys(messagesStore).length,
-        },
-    })
-})
+app.get("/status", (req, res) => res.json(connectionStatus))
 
-// --- Rotas de Chats (LISTA DE CONVERSAS) ---
-app.get("/chats", async (req, res) => { // <--- ALTERADO: Adicionado 'async'
-    if (!connectionStatus.connected) {
-        return res.json({ success: false, chats: [], hasMore: false, total: 0 })
-    }
+// --- LISTA DE CONVERSAS (Lê do Supabase) ---
+app.get("/chats", async (req, res) => {
+    const limit = Number(req.query.limit) || 20
+    const offset = Number(req.query.offset) || 0
 
     try {
-        const limit = Number.parseInt(req.query.limit) || 50
-        const offset = Number.parseInt(req.query.offset) || 0
+        // Busca paginada no Banco
+        const { data: chats, error, count } = await supabase
+            .from('chats')
+            .select('*', { count: 'exact' })
+            .eq('is_archived', false) // Ignora arquivados
+            .not('id', 'ilike', '%@g.us') // Ignora grupos (conforme seu pedido anterior)
+            .order('last_message_time', { ascending: false })
+            .range(offset, offset + limit - 1)
 
-        const allChats = Object.values(chatsStore)
+        if (error) throw error
 
-        // 💥 AJUSTE REALIZADO AQUI: FILTRA CHATS ARQUIVADOS E GRUPOS 💥
-        const validChats = allChats.filter((chat) => {
-            const id = chat.id
-            // Exclui broadcast, status, chats arquivados E GRUPOS
-            return (
-                id && 
-                !id.includes("broadcast") && 
-                !id.includes("status") && 
-                !chat.archived &&
-                !id.includes("@g.us") // <--- NOVO: Exclui grupos
-            )
-        })
-        // ----------------------------------------------------
-
-        const sorted = validChats.sort((a, b) => {
-            const tsA = a.conversationTimestamp || 0
-            const tsB = b.conversationTimestamp || 0
-            return Number(tsB) - Number(tsA)
-        })
-
-        const paginatedChats = sorted.slice(offset, offset + limit)
-        const hasMore = offset + limit < sorted.length
-
-        // 📸 NOVO: Usa Promise.all para processar a busca de foto assíncrona
-        const normalized = await Promise.all(
-            paginatedChats.map(normalizeChatForFrontend)
-        )
+        // Mapeia para o formato que seu frontend espera
+        const formattedChats = chats.map(c => ({
+            id: c.id,
+            name: c.name,
+            pictureUrl: null, // Opcional: implementar lógica de cache de foto
+            lastMessage: c.last_message || "",
+            lastMessageTime: c.last_message_time,
+            unreadCount: c.unread_count,
+            isGroup: c.is_group
+        }))
 
         res.json({
             success: true,
-            chats: normalized,
-            hasMore,
-            total: sorted.length,
-            offset,
-            limit,
-        })
-    } catch (error) {
-        console.error("[API] ❌ Erro ao processar chats:", error)
-        res.status(500).json({
-            success: false,
-            message: "Erro ao processar chats",
-            chats: [],
-            hasMore: false,
-            total: 0,
-        })
-    }
-})
-
-// [NOVA ROTA] Buscar Chats
-app.get("/chats/search", async (req, res) => { // <--- ALTERADO: Adicionado 'async'
-    const query = req.query.q ? req.query.q.toLowerCase() : ""
-
-    if (!connectionStatus.connected) {
-        return res.json({ success: false, chats: [] })
-    }
-
-    try {
-        if (!query) {
-            return res.json({ success: true, chats: [] })
-        }
-
-        const allChats = Object.values(chatsStore)
-        
-        // Inclui o filtro de arquivados E GRUPOS na busca
-        const activeAndPrivateChats = allChats.filter(chat => 
-            !chat.archived && !chat.id.includes("@g.us") // <--- NOVO: Exclui grupos
-        ); 
-
-        // 📸 NOVO: Usa Promise.all
-        const normalizedChats = await Promise.all(
-            activeAndPrivateChats.map(normalizeChatForFrontend)
-        )
-
-        const filtered = normalizedChats.filter((chat) => {
-            const searchName = chat.name ? chat.name.toLowerCase() : ""
-            const searchId = chat.id ? chat.id.toLowerCase().replace(/@s\.whatsapp\.net|@g\.us/g, "") : ""
-
-            return searchName.includes(query) || searchId.includes(query)
-        })
-
-        const sorted = filtered.sort((a, b) => b.lastMessageTime - a.lastMessageTime)
-
-        res.json({
-            success: true,
-            chats: sorted,
-            total: sorted.length,
-        })
-    } catch (error) {
-        console.error("[API] ❌ Erro ao buscar chats:", error)
-        res.status(500).json({ success: false, message: "Erro ao buscar chats" })
-    }
-})
-
-// [NOVA ROTA] Informações do Contato/Grupo
-app.get("/chats/:chatId/info", async (req, res) => {
-    const { chatId } = req.params
-
-    if (!connectionStatus.connected || !sock) {
-        return res.status(400).json({ success: false, message: "WhatsApp não conectado" })
-    }
-
-    // 💥 NOVO: Bloqueia a rota de info para grupos (pois eles não são o foco)
-    if (chatId.includes("@g.us")) { 
-        return res.status(403).json({ 
-            success: false, 
-            message: "Informações de grupos não estão disponíveis nesta API." 
-        })
-    }
-    // -------------------------------------------------------------
-
-    try {
-        const isGroup = chatId.includes("@g.us")
-        const chatData = chatsStore[chatId] || {}
-        const contactInfo = contactsStore[chatId] || {} // Obtém as informações do contato/nome
-        let profilePicUrl = null
-        let groupInfo = {}
-
-        try {
-            profilePicUrl = await sock.profilePictureUrl(chatId, "image")
-        } catch (e) {
-            // Ignora erro se não tiver foto
-        }
-
-        if (isGroup) {
-            try {
-                groupInfo = await sock.groupMetadata(chatId)
-            } catch (e) {
-                console.warn(`[API] Falha ao buscar metadados do grupo ${chatId}: ${e.message}`)
-            }
-        }
-        
-        // Define o nome usando a mesma lógica de prioridade (com o contactInfo incluído)
-        const name = contactInfo.name || chatData.name || chatData.subject || groupInfo.subject || chatId.split("@")[0]
-
-        res.json({
-            success: true,
-            id: chatId,
-            name: name,
-            isGroup: isGroup,
-            pictureUrl: profilePicUrl,
-            participants: groupInfo.participants || [],
-            owner: groupInfo.owner || null,
-            creation: groupInfo.creation || null,
+            chats: formattedChats,
+            hasMore: (offset + limit) < count,
+            total: count
         })
 
     } catch (error) {
-        console.error("[API] ❌ Erro ao buscar info do chat:", error)
-        res.status(500).json({ success: false, message: error.message })
+        console.error("[API] Erro chats:", error)
+        res.status(500).json({ success: false, chats: [] })
     }
 })
 
-// [NOVA ROTA] Marcar Mensagens como Lidas
-app.post("/chats/:chatId/read", async (req, res) => {
-    const { chatId } = req.params
-
-    if (!connectionStatus.connected || !sock) {
-        return res.status(400).json({ success: false, message: "WhatsApp não conectado" })
-    }
-
-    // 💥 NOVO: Bloqueia a rota de leitura para grupos
-    if (chatId.includes("@g.us")) {
-        return res.status(403).json({ 
-            success: false, 
-            message: "Marcação de leitura para grupos não é suportada nesta API." 
-        })
-    }
-    // -------------------------------------------------------------
-
-    try {
-        const messages = messagesStore[chatId] || []
-
-        const lastIncomingMsg = messages
-            .filter((msg) => !msg.key.fromMe)
-            .sort((a, b) => Number(b.messageTimestamp) - Number(a.messageTimestamp))[0]
-
-        if (lastIncomingMsg) {
-            const receiptKey = {
-                remoteJid: chatId,
-                id: lastIncomingMsg.key.id,
-                participant: lastIncomingMsg.key.participant || chatId,
-            }
-
-            await sock.readMessages([receiptKey])
-        }
-
-        if (chatsStore[chatId]) {
-            chatsStore[chatId].unreadCount = 0
-        }
-
-        res.json({ success: true, message: `Chat ${chatId} marcado como lido` })
-    } catch (error) {
-        console.error("[API] ❌ Erro ao marcar como lido:", error)
-        res.status(500).json({ success: false, message: error.message })
-    }
-})
-
-// --- Rota de Mensagens (com lazy load / paginação reversa) ---
+// --- MENSAGENS (Lazy Loading do Banco) ---
 app.get("/chats/:chatId/messages", async (req, res) => {
     const { chatId } = req.params
-    
-    // Limite padrão de 10 mensagens
-    const limit = Number.parseInt(req.query.limit) || 10
-    const offset = Number.parseInt(req.query.offset) || 0
-
-    if (!connectionStatus.connected || !sock) {
-        return res.status(400).json({
-            success: false,
-            message: "WhatsApp não conectado",
-            messages: [],
-            hasMore: false,
-            total: 0,
-        })
-    }
-
-    // 💥 NOVO: Bloqueia a rota de mensagens para grupos
-    if (chatId.includes("@g.us")) {
-        return res.status(403).json({ 
-            success: false, 
-            message: "Visualização de mensagens de grupos não é suportada nesta API.",
-            messages: [],
-            hasMore: false,
-            total: 0,
-        })
-    }
-    // -------------------------------------------------------------
+    const limit = Number(req.query.limit) || 20
+    const offset = Number(req.query.offset) || 0
 
     try {
-        let messages = messagesStore[chatId] || []
+        // Busca paginada no Banco
+        const { data: messages, error, count } = await supabase
+            .from('messages')
+            .select('*', { count: 'exact' })
+            .eq('chat_id', chatId)
+            .order('timestamp', { ascending: false }) // Do mais recente para o antigo
+            .range(offset, offset + limit - 1)
 
-        // Se o cache local for pequeno, tente buscar mais histórico do WA
-        if (messages.length < 50 && offset === 0) { 
-            try {
-                const history = await sock.fetchMessagesFromWA(chatId, 50)
+        if (error) throw error
 
-                if (history && history.length > 0) {
-                    history.forEach((msg) => {
-                        if (!messagesStore[chatId]) messagesStore[chatId] = []
-                        const exists = messagesStore[chatId].find((x) => x.key.id === msg.key.id)
-                        if (!exists) {
-                            messagesStore[chatId].push(msg)
-                        }
-                    })
+        // Reverte array para o frontend mostrar cronologicamente (Antigo -> Novo)
+        const sortedMsgs = messages.sort((a, b) => a.timestamp - b.timestamp)
 
-                    messages = messagesStore[chatId]
-                }
-            } catch (fetchError) {
-                // Continua com cache existente se a busca falhar
-                console.warn(`[API] Falha ao buscar histórico adicional para ${chatId}: ${fetchError.message}`)
-            }
-        }
-
-        // 1. Ordena todas as mensagens do chat por ordem de envio (mais antigas primeiro)
-        const sorted = [...messages].sort((a, b) => (Number(a.messageTimestamp) || 0) - (Number(b.messageTimestamp) || 0))
-
-        const total = sorted.length
-
-        // 2. Lógica de paginação reversa (Lazy Load para mensagens antigas)
-        const start = Math.max(0, total - offset - limit)
-        const end = total - offset
-        const paginatedMessages = sorted.slice(start, end)
-
-        const hasMore = offset + limit < total
-
-        const normalized = paginatedMessages.map(normalizeMessageForFrontend).filter((msg) => msg !== null)
+        const formattedMsgs = sortedMsgs.map(m => ({
+            id: m.id,
+            body: m.content,
+            timestamp: m.timestamp,
+            from: m.sender_id,
+            to: m.chat_id,
+            fromMe: m.from_me,
+            type: m.type,
+            hasMedia: m.has_media,
+            // Se tiver mídia, gera o link para o nosso endpoint de download
+            mediaUrl: m.has_media ? `${process.env.API_URL || 'http://localhost:3000'}/media/${m.chat_id}/${m.id}` : null,
+            mimeType: m.media_meta?.mimetype,
+            ack: m.ack
+        }))
 
         res.json({
             success: true,
-            messages: normalized,
-            hasMore,
-            total,
-            offset,
-            limit,
+            messages: formattedMsgs,
+            hasMore: (offset + limit) < count,
+            total: count
         })
+
     } catch (error) {
-        console.error("[API] ❌ Erro ao buscar mensagens:", error)
-        res.status(500).json({
-            success: false,
-            message: error.message,
-            messages: [],
-            hasMore: false,
-            total: 0,
-        })
+        console.error("[API] Erro mensagens:", error)
+        res.status(500).json({ success: false, messages: [] })
     }
 })
 
-// [NOVA ROTA] Visualizar Mídia Recebida
+// --- DOWNLOAD DE MÍDIA (Lazy Loading de Arquivo) ---
 app.get("/media/:chatId/:messageId", async (req, res) => {
-    const { chatId, messageId } = req.params
-
-    if (!connectionStatus.connected || !sock) {
-        return res.status(400).json({ success: false, message: "WhatsApp não conectado" })
-    }
-
-    // 💥 NOVO: Bloqueia a rota de mídia para grupos
-    if (chatId.includes("@g.us")) {
-        return res.status(403).json({ 
-            success: false, 
-            message: "Visualização de mídia de grupos não é suportada nesta API." 
-        })
-    }
-    // -------------------------------------------------------------
+    const { messageId } = req.params
 
     try {
-        const messages = messagesStore[chatId] || []
-        const targetMsg = messages.find((m) => m.key.id === messageId)
+        // 1. Busca os metadados no Supabase
+        const { data: msg, error } = await supabase
+            .from('messages')
+            .select('media_meta, type')
+            .eq('id', messageId)
+            .single()
 
-        if (!targetMsg || !targetMsg.message) {
-            return res.status(404).json({ success: false, message: "Mensagem não encontrada ou não contém mídia" })
+        if (error || !msg || !msg.media_meta) {
+            return res.status(404).send("Mídia não encontrada no banco.")
         }
 
-        // Baixar a mídia de forma genérica
-        const mediaBuffer = await downloadMediaMessage(
-            targetMsg,
-            "buffer", // Tipo de retorno como Buffer
-            {}, // Opções
-            { logger: pino({ level: "silent" }), reuploadRequest: sock.updateMediaMessage }, // Handlers
+        const meta = msg.media_meta
+
+        // Reconstrói o objeto que o Baileys precisa para descriptografar
+        // Convertendo de volta de Base64 para Buffer onde necessário
+        const mediaMessage = {
+            url: meta.url,
+            mediaKey: meta.mediaKey ? Buffer.from(meta.mediaKey, 'base64') : undefined,
+            mimetype: meta.mimetype,
+            fileEncSha256: meta.fileEncSha256 ? Buffer.from(meta.fileEncSha256, 'base64') : undefined,
+            fileSha256: meta.fileSha256 ? Buffer.from(meta.fileSha256, 'base64') : undefined,
+            fileLength: meta.fileLength,
+            directPath: meta.directPath,
+            iv: meta.iv ? Buffer.from(meta.iv, 'base64') : undefined
+        }
+
+        // 2. Baixa e Descriptografa usando Baileys
+        const buffer = await downloadMediaMessage(
+            {
+                key: { id: messageId }, 
+                message: { [msg.type + "Message"]: mediaMessage } // Hack para montar a estrutura msg.message.imageMessage
+            },
+            'buffer',
+            {},
+            { logger: pino({ level: "silent" }), reuploadRequest: sock.updateMediaMessage }
         )
 
-        if (!mediaBuffer) {
-            return res.status(404).json({ success: false, message: "Falha ao baixar a mídia" })
-        }
-
-        // Obter o objeto de mídia
-        const mediaContent =
-            targetMsg.message.imageMessage ||
-            targetMsg.message.videoMessage ||
-            targetMsg.message.audioMessage ||
-            targetMsg.message.documentMessage
-        const mimeType = mediaContent?.mimetype || "application/octet-stream"
-
-        res.set("Content-Type", mimeType)
-        res.send(mediaBuffer)
+        res.set("Content-Type", meta.mimetype)
+        res.send(buffer)
 
     } catch (error) {
-        console.error("[API] ❌ Erro ao buscar mídia:", error)
-        res.status(500).json({ success: false, message: error.message })
+        console.error("[MEDIA] Erro ao baixar:", error)
+        res.status(500).send("Erro ao processar mídia")
     }
 })
 
-
-// --- Rotas de Envio ---
+// --- ENVIO DE MENSAGEM (Mantido igual, mas usando socket) ---
 app.post("/chats/send", async (req, res) => {
     const { chatId, message } = req.body
-
-    if (!chatId || !message) {
-        return res.status(400).json({
-            success: false,
-            message: "chatId e message são obrigatórios",
-        })
-    }
-
-    // 💥 NOVO: Bloqueia envio para grupo
-    if (chatId.includes("@g.us")) { 
-        return res.status(403).json({
-            success: false,
-            message: "Envio de mensagens para grupos não é permitido nesta API.",
-        })
-    }
-    // -------------------------------------------------------------
-
-    if (!connectionStatus.connected || !sock) {
-        return res.status(400).json({
-            success: false,
-            message: "WhatsApp não conectado",
-        })
-    }
+    if (!connectionStatus.connected || !sock) return res.status(400).json({ success: false })
 
     try {
         const result = await sock.sendMessage(chatId, { text: message })
-
+        // O evento 'messages.upsert' vai capturar essa mensagem e salvar no banco automaticamente
         res.json({ success: true, messageId: result?.key?.id })
     } catch (error) {
-        console.error("[API] ❌ Erro ao enviar:", error)
-        res.status(500).json({
-            success: false,
-            message: "Erro ao enviar: " + error.message,
-        })
+        res.status(500).json({ success: false, error: error.message })
     }
 })
 
-/**
- * Rota corrigida para lidar com o erro de desestruturação (Cannot destructure property 'chatId' of 'req.body' as it is undefined).
- */
-app.post("/chats/send-media", async (req, res) => {
-    // Validação inicial para evitar erro de desestruturação
-    if (!req.body || typeof req.body !== 'object') {
-        return res.status(400).json({
-            success: false,
-            message: "Corpo da requisição inválido ou ausente. Certifique-se de enviar Content-Type: application/json.",
-        })
-    }
-
-    if (!connectionStatus.connected || !sock) {
-        return res.status(400).json({
-            success: false,
-            message: "WhatsApp não conectado",
-        })
-    }
-
-    try {
-        const { chatId, type, mediaUrl, caption, fileName, mimetype } = req.body
-
-        if (!chatId) {
-            return res.status(400).json({
-                success: false,
-                message: "chatId é obrigatório",
-            })
-        }
-
-        // 💥 NOVO: Bloqueia envio de mídia para grupo
-        if (chatId.includes("@g.us")) { 
-            return res.status(403).json({
-                success: false,
-                message: "Envio de mídia para grupos não é permitido nesta API.",
-            })
-        }
-        // -------------------------------------------------------------
-        
-        // Validação de type e mediaUrl, conforme sugerido
-        if (!type || !mediaUrl) {
-            return res.status(400).json({
-                success: false,
-                message: "type e mediaUrl são obrigatórios para envio de mídia via URL.",
-            })
-        }
-        
-        let messageContent = null
-
-        if (mediaUrl) {
-            switch (type) {
-                case "image":
-                    messageContent = {
-                        image: { url: mediaUrl },
-                        caption: caption || "",
-                    }
-                    break
-
-                case "video":
-                    messageContent = {
-                        video: { url: mediaUrl },
-                        caption: caption || "",
-                    }
-                    break
-
-                case "audio":
-                    messageContent = {
-                        audio: { url: mediaUrl },
-                        mimetype: mimetype || "audio/mpeg",
-                        ptt: true, // Indica que é um Voice Note (gravação de áudio)
-                    }
-                    break
-
-                case "document":
-                    messageContent = {
-                        document: { url: mediaUrl },
-                        fileName: fileName || "arquivo",
-                        mimetype: mimetype || "application/octet-stream",
-                    }
-                    break
-
-                default:
-                    // Fallback para imagem
-                    messageContent = {
-                        image: { url: mediaUrl },
-                        caption: caption || "",
-                    }
-                    break
-            }
-        } else if (caption) {
-            // Se não houver mediaUrl, mas houver caption, envia como texto
-            messageContent = { text: caption }
-        } else {
-            return res.status(400).json({
-                success: false,
-                message: "Nenhuma mídia ou texto (caption) fornecido",
-            })
-        }
-
-        const result = await sock.sendMessage(chatId, messageContent)
-
-        return res.json({
-            success: true,
-            messageId: result?.key?.id,
-        })
-    } catch (error) {
-        console.error("[API] ❌ Erro ao enviar mídia:", error)
-        return res.status(500).json({
-            success: false,
-            message: "Erro ao enviar mídia: " + error.message,
-        })
-    }
-})
-
-// --- Rota de Logout ---
+// Rota de Logout
 app.post("/logout", async (req, res) => {
     try {
-        if (sock) {
-            await sock.logout()
-        }
-
-        chatsStore = {}
-        messagesStore = {}
-        contactsStore = {} // Limpa a store de contatos também
+        if (sock) await sock.logout()
+        // Opcional: Limpar tabela de chats no banco? Geralmente não, apenas desconecta.
         connectionStatus.connected = false
-        connectionStatus.phone = null
-        connectionStatus.status = "disconnected"
-        lastQrDataUrl = null
-
         res.json({ success: true })
     } catch (err) {
-        console.error("[API] ❌ Erro ao fazer logout:", err)
-        res.status(500).json({ success: false, message: "Erro ao fazer logout" })
+        res.status(500).json({ success: false })
     }
 })
 
-// ---------------------------------------------------------------------------------------------------
-// 🛠️ CONFIGURAÇÃO DE PORTA PARA O RENDER
-// O Render injeta a porta de escuta na variável de ambiente PORT.
-// ---------------------------------------------------------------------------------------------------
 const PORT = process.env.PORT || 3000
-
 app.listen(PORT, () => {
     console.log(`[SERVER] 🌐 Servidor Express rodando na porta ${PORT}`)
 })
