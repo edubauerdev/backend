@@ -32,7 +32,7 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey)
 
-// ESTADO
+// ESTADO LOCAL (Mantido apenas para /health rápido, mas a verdade está no banco)
 let sock = null
 let isStarting = false
 let lastQrDataUrl = null
@@ -42,8 +42,25 @@ const connectionStatus = {
     status: "disconnected",
 }
 
-// Store local apenas para contatos (nomes são leves e vitais para performance)
 let contactStore = {}
+
+// --- FUNÇÃO DE STATUS DO BANCO (ESSENCIAL) ---
+async function updateStatusInDb(status, qrCode = null, phone = null) {
+    try {
+        console.log(`[DB] Atualizando status para: ${status}`)
+        const { error } = await supabase.from("instance_settings").upsert({
+            id: 1, // ID fixo para a instância
+            status: status,
+            qr_code: qrCode, // Salva o QR Code no banco para o front ler
+            phone: phone,
+            updated_at: new Date()
+        })
+        
+        if (error) console.error("[DB] Erro ao salvar status:", error.message)
+    } catch (err) {
+        console.error("[DB] Erro crítico status:", err)
+    }
+}
 
 // --- FUNÇÕES AUXILIARES ---
 
@@ -70,7 +87,6 @@ function getMessageType(msg) {
     return "text"
 }
 
-// Prepara mensagem para o Supabase
 function prepareMessageForDB(msg, chatId) {
     const type = getMessageType(msg)
     const hasMedia = ["image", "video", "audio", "document", "sticker"].includes(type)
@@ -106,15 +122,10 @@ function prepareMessageForDB(msg, chatId) {
     }
 }
 
-// Tenta resolver o nome do contato usando a store local ou dados do chat
 function resolveChatName(chatId, chatName, pushName) {
-    // 1. Prioridade: Nome salvo na agenda (contactStore)
     if (contactStore[chatId]) return contactStore[chatId];
-    // 2. Nome que veio no objeto chat
     if (chatName) return chatName;
-    // 3. PushName (nome público do usuário)
     if (pushName) return pushName;
-    // 4. Formatação do número
     return chatId.split('@')[0];
 }
 
@@ -139,58 +150,47 @@ async function startWhatsApp() {
             browser: ["WhatsApp Backend", "Chrome", "1.0.0"],
             syncFullHistory: true,
             generateHighQualityLinkPreview: true,
+            connectTimeoutMs: 60000, 
+            keepAliveIntervalMs: 10000,
         })
 
         sock.ev.on("creds.update", saveCreds)
 
         // --- SINCRONIZAÇÃO DE DADOS ---
-
-        // Atualização de Contatos (Nomes da Agenda)
         sock.ev.on("contacts.upsert", (contacts) => {
             contacts.forEach(c => {
-                if (c.name) {
-                    contactStore[c.id] = c.name;
-                    // Opcional: Atualizar nome no banco em background se quiser
-                }
+                if (c.name) contactStore[c.id] = c.name;
             })
         })
 
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
             console.log(`[SYNC] 🌊 Recebendo histórico: ${chats.length} chats, ${messages.length} msgs.`)
 
-            // 1. Popula a memória local com nomes da agenda
             if (contacts) {
                 contacts.forEach(c => {
                     if (c.name) contactStore[c.id] = c.name
                 })
             }
 
-            // 2. Processa Chats (Filtrando grupos)
             const privateChats = chats.filter(c => !c.id.includes("@g.us"));
-            
             if (privateChats.length > 0) {
                 const chatsBatch = privateChats.map(c => ({
                     id: c.id,
-                    // AQUI ESTÁ A CORREÇÃO DO NOME:
                     name: resolveChatName(c.id, c.name, null), 
                     unread_count: c.unreadCount || 0,
                     is_group: false,
                     is_archived: c.archived || false,
                     last_message_time: c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : Date.now(),
-                    // image_url deixamos null ou undefined para não sobrescrever se já existir
                 }))
 
                 for (let i = 0; i < chatsBatch.length; i += 100) {
                     const batch = chatsBatch.slice(i, i + 100)
-                    // upsert ignorando image_url se não passarmos, para não apagar fotos já salvas
                     const { error } = await supabase.from("chats").upsert(batch, { onConflict: 'id' })
                     if (error) console.error("[SYNC] Erro chats:", error.message)
                 }
             }
 
-            // 3. Processa Mensagens (Filtrando grupos)
             const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
-            
             if (privateMessages.length > 0) {
                 const msgsBatch = privateMessages.map(m => prepareMessageForDB(m, m.key.remoteJid))
                 for (let i = 0; i < msgsBatch.length; i += 500) {
@@ -199,12 +199,14 @@ async function startWhatsApp() {
                     if (error) console.error("[SYNC] Erro msgs:", error.message)
                 }
             }
-
+            
+            // 🔥 Assim que sincroniza, confirma conexão no banco
+            await updateStatusInDb("connected", null, sock?.user?.id)
+            
             console.log("[SYNC] ✅ Concluído.")
             if (global.gc) global.gc()
         })
 
-        // Eventos Tempo Real
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
             if (type !== "notify" && type !== "append") return
             for (const msg of messages) {
@@ -214,48 +216,61 @@ async function startWhatsApp() {
                 const msgDB = prepareMessageForDB(msg, chatId)
                 await supabase.from("messages").upsert(msgDB)
 
-                // Atualiza Chat com o nome (caso seja um número novo que mandou msg)
                 const updateData = {
                     last_message: getMessageText(msg),
                     last_message_time: Number(msg.messageTimestamp) * 1000
                 }
-                
-                // Se não temos o nome desse chat ainda no banco, tentamos resolver com pushName
                 if (!contactStore[chatId] && msg.pushName) {
                     updateData.name = msg.pushName
                 }
-
                 await supabase.from("chats").update(updateData).eq("id", chatId)
             }
         })
 
-        // Conexão
+        // --- CONEXÃO E STATUS (AQUI O MÁGICA ACONTECE) ---
         sock.ev.on("connection.update", async (update) => {
             const { connection, lastDisconnect, qr } = update
+            
+            // 1. Gerou QR Code -> Envia para o Banco
             if (qr) {
                 lastQrDataUrl = await qrcode.toDataURL(qr)
                 connectionStatus.status = "qr"
+                console.log("[STATUS] 📱 QR Code gerado")
+                await updateStatusInDb("qr", lastQrDataUrl, null)
             }
+            
+            // 2. Conectou -> Envia para o Banco
             if (connection === "open") {
                 connectionStatus.connected = true
                 connectionStatus.phone = sock.user?.id
                 connectionStatus.status = "connected"
                 lastQrDataUrl = null
                 console.log("[WHATSAPP] ✅ Online")
+                await updateStatusInDb("connected", null, sock.user?.id)
             }
+            
+            // 3. Desconectou -> Envia para o Banco
             if (connection === "close") {
                 const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
                 connectionStatus.connected = false
                 connectionStatus.status = "disconnected"
+                lastQrDataUrl = null
+                
+                console.log("[STATUS] ❌ Desconectado. Razão:", reason)
+                await updateStatusInDb("disconnected", null, null)
+
                 if (reason !== DisconnectReason.loggedOut) {
                     isStarting = false
                     setTimeout(startWhatsApp, 3000)
+                } else {
+                    await updateStatusInDb("disconnected", null, null)
                 }
             }
         })
 
     } catch (err) {
         console.error("Erro start:", err)
+        await updateStatusInDb("error", null, null)
         isStarting = false
     }
 }
@@ -272,13 +287,11 @@ app.get("/qr", (req, res) => {
     return res.send(lastQrDataUrl)
 })
 
-// --- ROTA DE CHATS (COM LAZY LOADING DE FOTO E NOME) ---
 app.get("/chats", async (req, res) => {
     const limit = Number(req.query.limit) || 20
     const offset = Number(req.query.offset) || 0
 
     try {
-        // 1. Busca no Banco
         const { data: chats, error, count } = await supabase
             .from('chats')
             .select('*', { count: 'exact' })
@@ -289,27 +302,16 @@ app.get("/chats", async (req, res) => {
 
         if (error) throw error
 
-        // 2. ESTRATÉGIA DE FOTO SOB DEMANDA (Lazy Loading)
-        // Se o chat não tem foto no banco (null), vamos tentar buscar no WA agora
         if (connectionStatus.connected && sock) {
-            // Filtra chats sem foto
             const chatsMissingPic = chats.filter(c => !c.image_url);
-            
-            // Processa em paralelo (mas sem travar a resposta principal se demorar muito)
-            // Usamos Promise.allSettled para não falhar se um der erro
             await Promise.allSettled(chatsMissingPic.map(async (c) => {
                 try {
-                    const url = await sock.profilePictureUrl(c.id, "image") // 'image' = alta qualidade
+                    const url = await sock.profilePictureUrl(c.id, "image")
                     if (url) {
-                        c.image_url = url // Atualiza para o retorno atual
-                        // Atualiza no banco para o futuro
+                        c.image_url = url
                         await supabase.from("chats").update({ image_url: url }).eq("id", c.id)
                     }
-                } catch (e) {
-                    // 404 (sem foto) ou 401 (privado). 
-                    // Podemos marcar no banco como "empty" para não tentar buscar de novo sempre?
-                    // Por enquanto deixamos null.
-                }
+                } catch (e) {}
             }))
         }
 
@@ -323,25 +325,16 @@ app.get("/chats", async (req, res) => {
             isGroup: false
         }))
 
-        res.json({
-            success: true,
-            chats: formattedChats,
-            hasMore: (offset + limit) < count,
-            total: count
-        })
-
+        res.json({ success: true, chats: formattedChats, hasMore: (offset + limit) < count, total: count })
     } catch (error) {
-        console.error("Erro chats:", error)
         res.status(500).json({ success: false, chats: [] })
     }
 })
 
-// --- MENSAGENS ---
 app.get("/chats/:chatId/messages", async (req, res) => {
     const { chatId } = req.params
     const limit = Number(req.query.limit) || 20
     const offset = Number(req.query.offset) || 0
-
     if (chatId.includes("@g.us")) return res.status(403).json({ success: false })
 
     try {
@@ -354,9 +347,7 @@ app.get("/chats/:chatId/messages", async (req, res) => {
 
         if (error) throw error
 
-        const sortedMsgs = messages.sort((a, b) => a.timestamp - b.timestamp)
-
-        const formattedMsgs = sortedMsgs.map(m => ({
+        const formattedMsgs = messages.sort((a, b) => a.timestamp - b.timestamp).map(m => ({
             id: m.id,
             body: m.content,
             timestamp: m.timestamp,
@@ -370,28 +361,19 @@ app.get("/chats/:chatId/messages", async (req, res) => {
             ack: m.ack
         }))
 
-        res.json({
-            success: true,
-            messages: formattedMsgs,
-            hasMore: (offset + limit) < count,
-            total: count
-        })
-
+        res.json({ success: true, messages: formattedMsgs, hasMore: (offset + limit) < count, total: count })
     } catch (error) {
         res.status(500).json({ success: false, messages: [] })
     }
 })
 
-// --- MÍDIA ---
 app.get("/media/:chatId/:messageId", async (req, res) => {
     const { chatId, messageId } = req.params
     if (chatId.includes("@g.us")) return res.status(403).send("Bloqueado")
 
     try {
-        const { data: msg, error } = await supabase
-            .from('messages').select('media_meta, type').eq('id', messageId).single()
-
-        if (error || !msg || !msg.media_meta) return res.status(404).send("Mídia não encontrada")
+        const { data: msg } = await supabase.from('messages').select('media_meta, type').eq('id', messageId).single()
+        if (!msg?.media_meta) return res.status(404).send("Mídia não encontrada")
 
         const meta = msg.media_meta
         const mediaMessage = {
@@ -409,12 +391,9 @@ app.get("/media/:chatId/:messageId", async (req, res) => {
             { key: { id: messageId }, message: { [msg.type + "Message"]: mediaMessage } },
             'buffer', {}, { logger: pino({ level: "silent" }), reuploadRequest: sock.updateMediaMessage }
         )
-
         res.set("Content-Type", meta.mimetype)
         res.send(buffer)
-    } catch (error) {
-        res.status(500).send("Erro mídia")
-    }
+    } catch (error) { res.status(500).send("Erro mídia") }
 })
 
 app.post("/chats/send", async (req, res) => {
@@ -425,15 +404,15 @@ app.post("/chats/send", async (req, res) => {
     try {
         const result = await sock.sendMessage(chatId, { text: message })
         res.json({ success: true, messageId: result?.key?.id })
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message })
-    }
+    } catch (error) { res.status(500).json({ success: false }) }
 })
 
 app.post("/logout", async (req, res) => {
     try {
         if (sock) await sock.logout()
         connectionStatus.connected = false
+        // Força desconexão no banco
+        await updateStatusInDb("disconnected", null, null)
         res.json({ success: true })
     } catch (err) { res.status(500).json({ success: false }) }
 })
