@@ -1,4 +1,4 @@
-require("dotenv").config() // Garante leitura do .env se existir localmente
+require("dotenv").config()
 const express = require("express")
 const cors = require("cors")
 const { Boom } = require("@hapi/boom")
@@ -17,28 +17,22 @@ const qrcode = require("qrcode")
 const app = express()
 app.use(cors())
 
-// -------------------------
 // AJUSTE DE LIMITE DE PAYLOAD
-// -------------------------
 app.use(express.json({ limit: '20mb' }))
 app.use(express.urlencoded({ limit: '20mb', extended: true }))
 
-// -------------------------
-// CONFIGURAÇÃO SUPABASE (ESSENCIAL)
-// -------------------------
+// CONFIGURAÇÃO SUPABASE
 const supabaseUrl = process.env.SUPABASE_URL
-const supabaseKey = process.env.SUPABASE_KEY // Use a chave SERVICE_ROLE para ter permissão de escrita total
+const supabaseKey = process.env.SUPABASE_KEY
 
 if (!supabaseUrl || !supabaseKey) {
-    console.error("❌ ERRO CRÍTICO: SUPABASE_URL e SUPABASE_KEY são obrigatórios nas variáveis de ambiente.")
+    console.error("❌ ERRO: Configure SUPABASE_URL e SUPABASE_KEY no .env")
     process.exit(1)
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey)
 
-// -------------------------
-// Estado da Conexão (Apenas controle, sem dados pesados)
-// -------------------------
+// ESTADO
 let sock = null
 let isStarting = false
 let lastQrDataUrl = null
@@ -48,11 +42,11 @@ const connectionStatus = {
     status: "disconnected",
 }
 
-// -------------------------
-// 🛠️ FUNÇÕES AUXILIARES (TRANSFORMADORES)
-// -------------------------
+// Store local apenas para contatos (nomes são leves e vitais para performance)
+let contactStore = {}
 
-// Extrai texto simples da mensagem
+// --- FUNÇÕES AUXILIARES ---
+
 function getMessageText(msg) {
     if (!msg || !msg.message) return ""
     const content = msg.message
@@ -61,10 +55,11 @@ function getMessageText(msg) {
     if (content.imageMessage?.caption) return content.imageMessage.caption || "[Imagem]"
     if (content.videoMessage?.caption) return content.videoMessage.caption || "[Vídeo]"
     if (content.documentMessage?.caption) return content.documentMessage.caption || "[Documento]"
+    if (content.audioMessage) return "[Áudio]"
+    if (content.stickerMessage) return "[Sticker]"
     return ""
 }
 
-// Determina o tipo de mensagem
 function getMessageType(msg) {
     if (!msg.message) return "text"
     if (msg.message.imageMessage) return "image"
@@ -75,18 +70,15 @@ function getMessageType(msg) {
     return "text"
 }
 
-// Prepara mensagem para salvar no Banco (Extrai metadados de mídia e deleta o buffer)
+// Prepara mensagem para o Supabase
 function prepareMessageForDB(msg, chatId) {
     const type = getMessageType(msg)
     const hasMedia = ["image", "video", "audio", "document", "sticker"].includes(type)
-    
     let mediaMeta = null
 
     if (hasMedia) {
-        // Extrai o objeto de mídia (imageMessage, videoMessage, etc)
         const messageContent = msg.message[type + "Message"]
         if (messageContent) {
-            // SALVA APENAS OS DADOS NECESSÁRIOS PARA BAIXAR DEPOIS
             mediaMeta = {
                 url: messageContent.url,
                 mediaKey: messageContent.mediaKey ? Buffer.from(messageContent.mediaKey).toString('base64') : null,
@@ -95,7 +87,7 @@ function prepareMessageForDB(msg, chatId) {
                 fileSha256: messageContent.fileSha256 ? Buffer.from(messageContent.fileSha256).toString('base64') : null,
                 fileLength: messageContent.fileLength,
                 directPath: messageContent.directPath,
-                iv: messageContent.iv ? Buffer.from(messageContent.iv).toString('base64') : null, // Necessário para alguns tipos
+                iv: messageContent.iv ? Buffer.from(messageContent.iv).toString('base64') : null,
             }
         }
     }
@@ -109,25 +101,35 @@ function prepareMessageForDB(msg, chatId) {
         from_me: msg.key.fromMe || false,
         type: type,
         has_media: hasMedia,
-        media_meta: mediaMeta, // JSON leve
+        media_meta: mediaMeta,
         ack: msg.status || 0
     }
 }
 
-// -------------------------
-// 🚀 INICIAR O WHATSAPP
-// -------------------------
+// Tenta resolver o nome do contato usando a store local ou dados do chat
+function resolveChatName(chatId, chatName, pushName) {
+    // 1. Prioridade: Nome salvo na agenda (contactStore)
+    if (contactStore[chatId]) return contactStore[chatId];
+    // 2. Nome que veio no objeto chat
+    if (chatName) return chatName;
+    // 3. PushName (nome público do usuário)
+    if (pushName) return pushName;
+    // 4. Formatação do número
+    return chatId.split('@')[0];
+}
+
+// --- WHATSAPP START ---
 async function startWhatsApp() {
     if (isStarting) return
     isStarting = true
 
     try {
-        console.log("[WHATSAPP] 🚀 Iniciando conexão...")
+        console.log("[WHATSAPP] 🚀 Iniciando...")
         const { version } = await fetchLatestBaileysVersion()
         const logger = pino({ level: "silent" })
         const { state, saveCreds } = await useMultiFileAuthState("./auth_info")
 
-        const socket = makeWASocket({
+        sock = makeWASocket({
             version,
             logger,
             auth: {
@@ -135,136 +137,116 @@ async function startWhatsApp() {
                 keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
             browser: ["WhatsApp Backend", "Chrome", "1.0.0"],
-            // 💡 IMPORTANTE: syncFullHistory: true é seguro agora porque NÃO guardamos na RAM.
-            // O processamento será feito via Stream para o Supabase.
-            syncFullHistory: true, 
+            syncFullHistory: true,
             generateHighQualityLinkPreview: true,
         })
 
-        sock = socket
         sock.ev.on("creds.update", saveCreds)
 
-        // -------------------------
-        // 🌊 O "CANO" (PIPELINE) DE DADOS
-        // Recebe do WA -> Joga no Supabase -> Limpa RAM
-        // -------------------------
-        
-        // 1. Histórico Inicial / Sincronização
-        sock.ev.on("messaging-history.set", async ({ chats, messages }) => {
-            console.log(`[SYNC] 🌊 Recebendo Tsunami: ${chats.length} chats, ${messages.length} mensagens.`)
+        // --- SINCRONIZAÇÃO DE DADOS ---
 
-            // A) Processar Chats
-            if (chats.length > 0) {
-                const chatsBatch = chats.map(c => ({
+        // Atualização de Contatos (Nomes da Agenda)
+        sock.ev.on("contacts.upsert", (contacts) => {
+            contacts.forEach(c => {
+                if (c.name) {
+                    contactStore[c.id] = c.name;
+                    // Opcional: Atualizar nome no banco em background se quiser
+                }
+            })
+        })
+
+        sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
+            console.log(`[SYNC] 🌊 Recebendo histórico: ${chats.length} chats, ${messages.length} msgs.`)
+
+            // 1. Popula a memória local com nomes da agenda
+            if (contacts) {
+                contacts.forEach(c => {
+                    if (c.name) contactStore[c.id] = c.name
+                })
+            }
+
+            // 2. Processa Chats (Filtrando grupos)
+            const privateChats = chats.filter(c => !c.id.includes("@g.us"));
+            
+            if (privateChats.length > 0) {
+                const chatsBatch = privateChats.map(c => ({
                     id: c.id,
-                    name: c.name || c.subject || c.verifiedName || (c.id.includes("@s.whatsapp.net") ? c.id.split("@")[0] : "Desconhecido"),
+                    // AQUI ESTÁ A CORREÇÃO DO NOME:
+                    name: resolveChatName(c.id, c.name, null), 
                     unread_count: c.unreadCount || 0,
-                    is_group: c.id.includes("@g.us"),
+                    is_group: false,
                     is_archived: c.archived || false,
-                    last_message_time: c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : Date.now()
+                    last_message_time: c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : Date.now(),
+                    // image_url deixamos null ou undefined para não sobrescrever se já existir
                 }))
 
-                // Upsert em lotes de 100 para não travar o banco
                 for (let i = 0; i < chatsBatch.length; i += 100) {
                     const batch = chatsBatch.slice(i, i + 100)
+                    // upsert ignorando image_url se não passarmos, para não apagar fotos já salvas
                     const { error } = await supabase.from("chats").upsert(batch, { onConflict: 'id' })
-                    if (error) console.error("[SYNC] Erro ao salvar chats:", error.message)
+                    if (error) console.error("[SYNC] Erro chats:", error.message)
                 }
             }
 
-            // B) Processar Mensagens (Pipeline para o Banco)
-            if (messages.length > 0) {
-                const msgsBatch = messages.map(m => prepareMessageForDB(m, m.key.remoteJid))
-                
-                // Salva em lotes de 500
+            // 3. Processa Mensagens (Filtrando grupos)
+            const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
+            
+            if (privateMessages.length > 0) {
+                const msgsBatch = privateMessages.map(m => prepareMessageForDB(m, m.key.remoteJid))
                 for (let i = 0; i < msgsBatch.length; i += 500) {
                     const batch = msgsBatch.slice(i, i + 500)
                     const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' })
-                    if (error) console.error("[SYNC] Erro ao salvar mensagens:", error.message)
+                    if (error) console.error("[SYNC] Erro msgs:", error.message)
                 }
             }
 
-            console.log("[SYNC] ✅ Dados salvos no Supabase. Memória RAM liberada.")
-            
-            // Força limpeza (opcional, Node faz auto, mas ajuda na lógica mental)
-            chats = null
-            messages = null 
+            console.log("[SYNC] ✅ Concluído.")
             if (global.gc) global.gc()
         })
 
-        // 2. Novas Mensagens (Tempo Real)
+        // Eventos Tempo Real
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
             if (type !== "notify" && type !== "append") return
-
             for (const msg of messages) {
                 const chatId = msg.key.remoteJid
-                if (!chatId || chatId === "status@broadcast") continue
+                if (!chatId || chatId.includes("@g.us") || chatId === "status@broadcast") continue
 
-                // 1. Salvar Mensagem no Banco
                 const msgDB = prepareMessageForDB(msg, chatId)
                 await supabase.from("messages").upsert(msgDB)
 
-                // 2. Atualizar o Chat (Última mensagem e unread)
+                // Atualiza Chat com o nome (caso seja um número novo que mandou msg)
                 const updateData = {
                     last_message: getMessageText(msg),
                     last_message_time: Number(msg.messageTimestamp) * 1000
                 }
                 
-                // Se não fui eu que enviei, incrementa contador
-                if (!msg.key.fromMe) {
-                    // Nota: Incremento atômico seria ideal, mas simplificamos aqui
-                    // Precisaria de uma RPC no supabase para incrementar seguro, 
-                    // vamos apenas definir como não lido por hora ou buscar e somar.
-                    // Para performance, vamos apenas atualizar o timestamp.
+                // Se não temos o nome desse chat ainda no banco, tentamos resolver com pushName
+                if (!contactStore[chatId] && msg.pushName) {
+                    updateData.name = msg.pushName
                 }
 
                 await supabase.from("chats").update(updateData).eq("id", chatId)
             }
         })
 
-        // 3. Atualizações de Chats (ex: arquivar, limpar unread)
-        sock.ev.on("chats.update", async (updates) => {
-            for (const update of updates) {
-                if (!update.id) continue
-                const { id, unreadCount, archived } = update
-                
-                const dataToUpdate = {}
-                if (unreadCount !== undefined) dataToUpdate.unread_count = unreadCount
-                if (archived !== undefined) dataToUpdate.is_archived = archived
-
-                if (Object.keys(dataToUpdate).length > 0) {
-                    await supabase.from("chats").update(dataToUpdate).eq("id", id)
-                }
-            }
-        })
-
-
-        // -------------------------
-        // CONEXÃO
-        // -------------------------
+        // Conexão
         sock.ev.on("connection.update", async (update) => {
             const { connection, lastDisconnect, qr } = update
-
             if (qr) {
                 lastQrDataUrl = await qrcode.toDataURL(qr)
                 connectionStatus.status = "qr"
-                console.log("[STATUS] 📱 QR Code gerado")
             }
-
             if (connection === "open") {
                 connectionStatus.connected = true
                 connectionStatus.phone = sock.user?.id
                 connectionStatus.status = "connected"
                 lastQrDataUrl = null
-                console.log("[WHATSAPP] ✅ Conectado:", sock.user?.id)
+                console.log("[WHATSAPP] ✅ Online")
             }
-
             if (connection === "close") {
                 const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
                 connectionStatus.connected = false
                 connectionStatus.status = "disconnected"
-                lastQrDataUrl = null
-
                 if (reason !== DisconnectReason.loggedOut) {
                     isStarting = false
                     setTimeout(startWhatsApp, 3000)
@@ -272,18 +254,15 @@ async function startWhatsApp() {
             }
         })
 
-        console.log("[WHATSAPP] ⚡ Socket iniciado")
     } catch (err) {
-        console.error("[WHATSAPP] ❌ Erro:", err)
+        console.error("Erro start:", err)
         isStarting = false
     }
 }
 
 startWhatsApp()
 
-// ---------------------------------------------------------------------------------------------------
-// ROTAS HTTP (Agora lendo do Supabase - Lazy Loading Real)
-// ---------------------------------------------------------------------------------------------------
+// --- ROTAS ---
 
 app.get("/health", (req, res) => res.json({ ok: true, status: connectionStatus }))
 
@@ -293,34 +272,55 @@ app.get("/qr", (req, res) => {
     return res.send(lastQrDataUrl)
 })
 
-app.get("/status", (req, res) => res.json(connectionStatus))
-
-// --- LISTA DE CONVERSAS (Lê do Supabase) ---
+// --- ROTA DE CHATS (COM LAZY LOADING DE FOTO E NOME) ---
 app.get("/chats", async (req, res) => {
     const limit = Number(req.query.limit) || 20
     const offset = Number(req.query.offset) || 0
 
     try {
-        // Busca paginada no Banco
+        // 1. Busca no Banco
         const { data: chats, error, count } = await supabase
             .from('chats')
             .select('*', { count: 'exact' })
-            .eq('is_archived', false) // Ignora arquivados
-            .not('id', 'ilike', '%@g.us') // Ignora grupos (conforme seu pedido anterior)
+            .eq('is_archived', false)
+            .not('id', 'ilike', '%@g.us')
             .order('last_message_time', { ascending: false })
             .range(offset, offset + limit - 1)
 
         if (error) throw error
 
-        // Mapeia para o formato que seu frontend espera
+        // 2. ESTRATÉGIA DE FOTO SOB DEMANDA (Lazy Loading)
+        // Se o chat não tem foto no banco (null), vamos tentar buscar no WA agora
+        if (connectionStatus.connected && sock) {
+            // Filtra chats sem foto
+            const chatsMissingPic = chats.filter(c => !c.image_url);
+            
+            // Processa em paralelo (mas sem travar a resposta principal se demorar muito)
+            // Usamos Promise.allSettled para não falhar se um der erro
+            await Promise.allSettled(chatsMissingPic.map(async (c) => {
+                try {
+                    const url = await sock.profilePictureUrl(c.id, "image") // 'image' = alta qualidade
+                    if (url) {
+                        c.image_url = url // Atualiza para o retorno atual
+                        // Atualiza no banco para o futuro
+                        await supabase.from("chats").update({ image_url: url }).eq("id", c.id)
+                    }
+                } catch (e) {
+                    // 404 (sem foto) ou 401 (privado). 
+                    // Podemos marcar no banco como "empty" para não tentar buscar de novo sempre?
+                    // Por enquanto deixamos null.
+                }
+            }))
+        }
+
         const formattedChats = chats.map(c => ({
             id: c.id,
             name: c.name,
-            pictureUrl: null, // Opcional: implementar lógica de cache de foto
+            pictureUrl: c.image_url, 
             lastMessage: c.last_message || "",
             lastMessageTime: c.last_message_time,
             unreadCount: c.unread_count,
-            isGroup: c.is_group
+            isGroup: false
         }))
 
         res.json({
@@ -331,29 +331,29 @@ app.get("/chats", async (req, res) => {
         })
 
     } catch (error) {
-        console.error("[API] Erro chats:", error)
+        console.error("Erro chats:", error)
         res.status(500).json({ success: false, chats: [] })
     }
 })
 
-// --- MENSAGENS (Lazy Loading do Banco) ---
+// --- MENSAGENS ---
 app.get("/chats/:chatId/messages", async (req, res) => {
     const { chatId } = req.params
     const limit = Number(req.query.limit) || 20
     const offset = Number(req.query.offset) || 0
 
+    if (chatId.includes("@g.us")) return res.status(403).json({ success: false })
+
     try {
-        // Busca paginada no Banco
         const { data: messages, error, count } = await supabase
             .from('messages')
             .select('*', { count: 'exact' })
             .eq('chat_id', chatId)
-            .order('timestamp', { ascending: false }) // Do mais recente para o antigo
+            .order('timestamp', { ascending: false })
             .range(offset, offset + limit - 1)
 
         if (error) throw error
 
-        // Reverte array para o frontend mostrar cronologicamente (Antigo -> Novo)
         const sortedMsgs = messages.sort((a, b) => a.timestamp - b.timestamp)
 
         const formattedMsgs = sortedMsgs.map(m => ({
@@ -365,7 +365,6 @@ app.get("/chats/:chatId/messages", async (req, res) => {
             fromMe: m.from_me,
             type: m.type,
             hasMedia: m.has_media,
-            // Se tiver mídia, gera o link para o nosso endpoint de download
             mediaUrl: m.has_media ? `${process.env.API_URL || 'http://localhost:3000'}/media/${m.chat_id}/${m.id}` : null,
             mimeType: m.media_meta?.mimetype,
             ack: m.ack
@@ -379,31 +378,22 @@ app.get("/chats/:chatId/messages", async (req, res) => {
         })
 
     } catch (error) {
-        console.error("[API] Erro mensagens:", error)
         res.status(500).json({ success: false, messages: [] })
     }
 })
 
-// --- DOWNLOAD DE MÍDIA (Lazy Loading de Arquivo) ---
+// --- MÍDIA ---
 app.get("/media/:chatId/:messageId", async (req, res) => {
-    const { messageId } = req.params
+    const { chatId, messageId } = req.params
+    if (chatId.includes("@g.us")) return res.status(403).send("Bloqueado")
 
     try {
-        // 1. Busca os metadados no Supabase
         const { data: msg, error } = await supabase
-            .from('messages')
-            .select('media_meta, type')
-            .eq('id', messageId)
-            .single()
+            .from('messages').select('media_meta, type').eq('id', messageId).single()
 
-        if (error || !msg || !msg.media_meta) {
-            return res.status(404).send("Mídia não encontrada no banco.")
-        }
+        if (error || !msg || !msg.media_meta) return res.status(404).send("Mídia não encontrada")
 
         const meta = msg.media_meta
-
-        // Reconstrói o objeto que o Baileys precisa para descriptografar
-        // Convertendo de volta de Base64 para Buffer onde necessário
         const mediaMessage = {
             url: meta.url,
             mediaKey: meta.mediaKey ? Buffer.from(meta.mediaKey, 'base64') : undefined,
@@ -415,53 +405,38 @@ app.get("/media/:chatId/:messageId", async (req, res) => {
             iv: meta.iv ? Buffer.from(meta.iv, 'base64') : undefined
         }
 
-        // 2. Baixa e Descriptografa usando Baileys
         const buffer = await downloadMediaMessage(
-            {
-                key: { id: messageId }, 
-                message: { [msg.type + "Message"]: mediaMessage } // Hack para montar a estrutura msg.message.imageMessage
-            },
-            'buffer',
-            {},
-            { logger: pino({ level: "silent" }), reuploadRequest: sock.updateMediaMessage }
+            { key: { id: messageId }, message: { [msg.type + "Message"]: mediaMessage } },
+            'buffer', {}, { logger: pino({ level: "silent" }), reuploadRequest: sock.updateMediaMessage }
         )
 
         res.set("Content-Type", meta.mimetype)
         res.send(buffer)
-
     } catch (error) {
-        console.error("[MEDIA] Erro ao baixar:", error)
-        res.status(500).send("Erro ao processar mídia")
+        res.status(500).send("Erro mídia")
     }
 })
 
-// --- ENVIO DE MENSAGEM (Mantido igual, mas usando socket) ---
 app.post("/chats/send", async (req, res) => {
     const { chatId, message } = req.body
+    if (chatId?.includes("@g.us")) return res.status(403).json({ success: false })
     if (!connectionStatus.connected || !sock) return res.status(400).json({ success: false })
 
     try {
         const result = await sock.sendMessage(chatId, { text: message })
-        // O evento 'messages.upsert' vai capturar essa mensagem e salvar no banco automaticamente
         res.json({ success: true, messageId: result?.key?.id })
     } catch (error) {
         res.status(500).json({ success: false, error: error.message })
     }
 })
 
-// Rota de Logout
 app.post("/logout", async (req, res) => {
     try {
         if (sock) await sock.logout()
-        // Opcional: Limpar tabela de chats no banco? Geralmente não, apenas desconecta.
         connectionStatus.connected = false
         res.json({ success: true })
-    } catch (err) {
-        res.status(500).json({ success: false })
-    }
+    } catch (err) { res.status(500).json({ success: false }) }
 })
 
 const PORT = process.env.PORT || 3000
-app.listen(PORT, () => {
-    console.log(`[SERVER] 🌐 Servidor Express rodando na porta ${PORT}`)
-})
+app.listen(PORT, () => console.log(`[SERVER] 🌐 Porta ${PORT}`))
