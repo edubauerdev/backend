@@ -13,7 +13,7 @@ const {
     downloadMediaMessage,
 } = require("@whiskeysockets/baileys")
 const qrcode = require("qrcode")
-const fs = require('fs') // Necessário para verificar se existe sessão salva
+const fs = require('fs')
 
 const app = express()
 app.use(cors())
@@ -39,7 +39,7 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
 let sock = null
 let isStarting = false
 let lastQrDataUrl = null
-let qrTimeout = null // ⏱️ Variável para controlar os 5 minutos
+let qrTimeout = null
 
 const connectionStatus = {
     connected: false,
@@ -64,7 +64,7 @@ async function updateStatusInDb(status, qrCode = null, phone = null) {
     } catch (err) { console.error("[DB] Erro:", err) }
 }
 
-// --- FUNÇÕES AUXILIARES DE MENSAGEM ---
+// --- FUNÇÕES AUXILIARES ---
 function getMessageText(msg) {
     if (!msg || !msg.message) return ""
     const content = msg.message
@@ -132,29 +132,26 @@ function resolveChatName(chatId, chatName, pushName) {
 
 // --- WHATSAPP START ---
 async function startWhatsApp(isManualStart = false) {
-    // Se já estiver conectado ou iniciando, ignora
     if (sock?.user || isStarting) {
         console.log("[WHATSAPP] Já está rodando ou iniciando.");
         return;
     }
 
-    // 🛑 VERIFICAÇÃO DE LOGIN:
-    // Se NÃO for manual (boot do server) E NÃO tiver credenciais salvas, 
-    // não faz nada. Espera o usuário clicar no botão.
+    // 🛑 LÓGICA DE ESPERA:
+    // Se não for manual e não tiver sessão, NÃO INICIA O BAILEYS.
+    // O Express continuará rodando esperando o clique no frontend.
     const hasAuthInfo = fs.existsSync("./auth_info/creds.json");
     if (!isManualStart && !hasAuthInfo) {
-        console.log("[WHATSAPP] 🛑 Nenhuma sessão salva. Aguardando comando manual para gerar QR.");
+        console.log("[WHATSAPP] 🛑 Modo de Espera: Aguardando solicitação de QR Code...");
         await updateStatusInDb("disconnected", null, null);
         return;
     }
 
     isStarting = true
-    
-    // Limpa timer anterior se existir
     if (qrTimeout) clearTimeout(qrTimeout);
 
     try {
-        console.log("[WHATSAPP] 🚀 Iniciando conexão...")
+        console.log("[WHATSAPP] 🚀 Iniciando socket...")
         const { version } = await fetchLatestBaileysVersion()
         const logger = pino({ level: "silent" })
         const { state, saveCreds } = await useMultiFileAuthState("./auth_info")
@@ -171,52 +168,79 @@ async function startWhatsApp(isManualStart = false) {
             generateHighQualityLinkPreview: true,
             connectTimeoutMs: 60000, 
             keepAliveIntervalMs: 10000,
-            printQRInTerminal: true, // Útil para debug
         })
 
         sock.ev.on("creds.update", saveCreds)
 
-        // --- TIMER DE 5 MINUTOS PARA QR CODE ---
-        // Se após 5 minutos não conectar, derruba tudo.
-        qrTimeout = setTimeout(async () => {
-            if (!sock?.user) {
-                console.log("[TIMEOUT] ⏰ 5 minutos passaram. Desligando socket.");
-                try {
-                    await sock.logout(); // Tenta logout limpo
-                } catch (e) {}
-                try {
-                    sock.end(undefined); // Força fechar
-                } catch (e) {}
-                
-                sock = null;
-                isStarting = false;
-                lastQrDataUrl = null;
-                await updateStatusInDb("disconnected", null, null);
-            }
-        }, 5 * 60 * 1000); // 5 Minutos em ms
+        // TIMER DE 5 MINUTOS (Só para login novo)
+        if (isManualStart) {
+            qrTimeout = setTimeout(async () => {
+                if (!sock?.user) {
+                    console.log("[TIMEOUT] ⏰ Tempo de QR esgotado. Desligando.");
+                    try { sock.end(undefined); } catch (e) {}
+                    sock = null;
+                    isStarting = false;
+                    lastQrDataUrl = null;
+                    await updateStatusInDb("disconnected", null, null);
+                }
+            }, 5 * 60 * 1000);
+        }
 
-
-        // --- EVENTOS ---
         sock.ev.on("contacts.upsert", (contacts) => {
             contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
         })
 
+        // --- SINCRONIZAÇÃO EM LOTES (Evita Crash) ---
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
             console.log(`[SYNC] 🌊 Importando histórico...`)
-            // Limpa o timer de timeout pois CONECTOU COM SUCESSO
-            if (qrTimeout) clearTimeout(qrTimeout);
+            if (qrTimeout) clearTimeout(qrTimeout); // Conectou, cancela timeout
 
-            // ... (Lógica de mensagens mantida igual - omitida para brevidade) ...
-            // ... (Use o mesmo bloco de código da resposta anterior para processar chats/msgs) ...
+            if (contacts) {
+                contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
+            }
+
+            const privateChats = chats.filter(c => !c.id.includes("@g.us"));
+            const lastMsgMap = {};
+            messages.forEach(msg => {
+                const jid = msg.key.remoteJid;
+                const ts = Number(msg.messageTimestamp);
+                if (!lastMsgMap[jid] || ts > lastMsgMap[jid]) lastMsgMap[jid] = ts;
+            });
+
+            // Processa chats em lotes de 50
+            for (let i = 0; i < privateChats.length; i += 50) {
+                const batch = privateChats.slice(i, i + 50).map(c => {
+                    let timestamp = lastMsgMap[c.id] || (c.conversationTimestamp ? Number(c.conversationTimestamp) : 0);
+                    if (timestamp > 0 && timestamp < 946684800000) timestamp = timestamp * 1000;
+                    if (timestamp === 0) timestamp = 1000; 
+
+                    return {
+                        id: c.id,
+                        name: resolveChatName(c.id, c.name, null), 
+                        unread_count: c.unreadCount || 0,
+                        is_group: false,
+                        is_archived: c.archived || false,
+                        last_message_time: timestamp, 
+                    };
+                });
+                await supabase.from("chats").upsert(batch, { onConflict: 'id' });
+                await new Promise(r => setTimeout(r, 50)); 
+            }
+
+            // Processa mensagens em lotes de 100
+            const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
+            for (let i = 0; i < privateMessages.length; i += 100) {
+                const batch = privateMessages.slice(i, i + 100).map(m => prepareMessageForDB(m, m.key.remoteJid));
+                await supabase.from("messages").upsert(batch, { onConflict: 'id' });
+                await new Promise(r => setTimeout(r, 100));
+            }
             
-            // Mas mantenha este trecho essencial no final do evento history.set:
             await updateStatusInDb("connected", null, sock?.user?.id)
-            console.log("[SYNC] ✅ Sincronização e Conexão Confirmadas.")
+            console.log("[SYNC] ✅ Sincronização Completa.")
+            if (global.gc) global.gc()
         })
 
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
-            // ... (Lógica de novas mensagens mantida igual) ...
-            // Apenas para garantir, copiei a lógica simplificada:
             if (type !== "notify" && type !== "append") return
             for (const msg of messages) {
                 const chatId = msg.key.remoteJid
@@ -236,23 +260,19 @@ async function startWhatsApp(isManualStart = false) {
             const { connection, lastDisconnect, qr } = update
             
             if (qr) {
-                // QR Code gerado (o Baileys muda ele a cada ~40s, isso é normal)
-                // Nós atualizamos o banco, mas o timer de 5min continua rodando
                 lastQrDataUrl = await qrcode.toDataURL(qr)
                 connectionStatus.status = "qr"
-                console.log("[STATUS] 📱 Novo QR Code gerado (Janela de 5min ativa)")
+                console.log("[STATUS] 📱 QR Code gerado")
                 await updateStatusInDb("qr", lastQrDataUrl, null)
             }
             
             if (connection === "open") {
-                // SUCESSO: Cancela o timer de desligamento
                 if (qrTimeout) clearTimeout(qrTimeout);
-                
                 connectionStatus.connected = true
                 connectionStatus.phone = sock.user?.id
                 connectionStatus.status = "connected"
                 lastQrDataUrl = null
-                console.log("[WHATSAPP] ✅ Online e Estável")
+                console.log("[WHATSAPP] ✅ Conectado")
                 await updateStatusInDb("connected", null, sock.user?.id)
             }
             
@@ -262,23 +282,15 @@ async function startWhatsApp(isManualStart = false) {
                 connectionStatus.status = "disconnected"
                 lastQrDataUrl = null
                 
-                console.log("[STATUS] ❌ Caiu. Razão:", reason)
+                console.log("[STATUS] ❌ Desconectado. Razão:", reason)
                 await updateStatusInDb("disconnected", null, null)
 
-                // LÓGICA DE RECONEXÃO INTELIGENTE:
-                // Só reconecta se:
-                // 1. Não foi Logout manual
-                // 2. Não foi Timeout dos 5 minutos (nosso controle)
-                // 3. JÁ ESTAVA LOGADO ANTES (tem sessão)
-                
                 const hasSession = fs.existsSync("./auth_info/creds.json");
-
                 if (reason !== DisconnectReason.loggedOut && hasSession) {
-                    console.log("🔄 Tentando reconectar automaticamente...");
+                    console.log("🔄 Reconectando...");
                     isStarting = false
                     setTimeout(() => startWhatsApp(false), 3000)
                 } else {
-                    console.log("🛑 Conexão encerrada. Aguardando comando manual.");
                     isStarting = false
                     sock = null
                 }
@@ -292,7 +304,7 @@ async function startWhatsApp(isManualStart = false) {
     }
 }
 
-// Inicia automaticamente APENAS se tiver sessão salva
+// Tenta iniciar se já tiver sessão, senão fica parado esperando comando
 startWhatsApp(false);
 
 const handleShutdown = async (signal) => {
@@ -307,21 +319,19 @@ process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
 // --- ROTAS ---
 
-// 🆕 ROTA NOVA: Botão "Gerar QR Code" chama isso
-app.post("/session/connect", async (req, res) => {
-    console.log("[API] Solicitada nova conexão manual");
-    // Força reset se estiver travado
-    if (sock) {
-        try { sock.end(undefined); sock = null; } catch(e){}
-    }
-    isStarting = false;
-    
-    // Inicia com flag manual = true
-    startWhatsApp(true); 
-    res.json({ success: true, message: "Iniciando sessão por 5 minutos..." });
+// ✅ ROTA RAIZ: ISSO IMPEDE O RENDER DE MATAR SEU SERVIDOR
+app.get("/", (req, res) => {
+    res.send("Backend WhatsApp Online 🚀");
 });
 
-// 🆕 ROTA NOVA: Botão "Desconectar"
+app.post("/session/connect", async (req, res) => {
+    console.log("[API] Solicitando conexão manual...");
+    if (sock) { try { sock.end(undefined); sock = null; } catch(e){} }
+    isStarting = false;
+    startWhatsApp(true); 
+    res.json({ success: true });
+});
+
 app.post("/session/disconnect", async (req, res) => {
     try {
         if (sock) await sock.logout();
@@ -330,12 +340,9 @@ app.post("/session/disconnect", async (req, res) => {
         isStarting = false;
         await updateStatusInDb("disconnected", null, null);
         res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Rotas antigas mantidas para compatibilidade
 app.get("/health", (req, res) => res.json({ ok: true, status: connectionStatus }))
 app.get("/qr", (req, res) => {
     if (connectionStatus.connected) return res.send("ALREADY_CONNECTED")
@@ -343,13 +350,66 @@ app.get("/qr", (req, res) => {
     return res.send(lastQrDataUrl)
 })
 
-// ... (Copie aqui as rotas de /chats, /messages, /media e /send do código anterior) ...
-// ... (Elas não mudam) ...
+// ... Rotas de chats, messages, media ... (COPIE AS MESMAS DO ANTERIOR AQUI)
+// Resumindo para caber na resposta:
+app.get("/chats", async (req, res) => { /* ... lógica de chats com range e order ... */ 
+    const limit = Number(req.query.limit) || 20
+    const offset = Number(req.query.offset) || 0
+    try {
+        const { data: chats, error, count } = await supabase.from('chats').select('*', { count: 'exact' }).eq('is_archived', false).not('id', 'ilike', '%@g.us').order('last_message_time', { ascending: false }).range(offset, offset + limit - 1)
+        if (error) throw error
+        if (connectionStatus.connected && sock) {
+            const chatsMissingPic = chats.filter(c => !c.image_url);
+            await Promise.allSettled(chatsMissingPic.map(async (c) => {
+                try { const url = await sock.profilePictureUrl(c.id, "image"); if (url) { c.image_url = url; await supabase.from("chats").update({ image_url: url }).eq("id", c.id) } } catch (e) {}
+            }))
+        }
+        const formattedChats = chats.map(c => ({ id: c.id, name: c.name, pictureUrl: c.image_url, lastMessage: c.last_message || "", lastMessageTime: c.last_message_time, unreadCount: c.unread_count, isGroup: false }))
+        res.json({ success: true, chats: formattedChats, hasMore: (offset + limit) < count, total: count })
+    } catch (error) { res.status(500).json({ success: false, chats: [] }) }
+})
 
-// Rota de Logout antiga (redireciona para a nova lógica)
+app.get("/chats/:chatId/messages", async (req, res) => { /* ... lógica de msgs ... */ 
+    const { chatId } = req.params
+    const limit = Number(req.query.limit) || 20
+    const offset = Number(req.query.offset) || 0
+    if (chatId.includes("@g.us")) return res.status(403).json({ success: false })
+    try {
+        const { data: messages, error, count } = await supabase.from('messages').select('*', { count: 'exact' }).eq('chat_id', chatId).order('timestamp', { ascending: false }).range(offset, offset + limit - 1)
+        if (error) throw error
+        const formattedMsgs = messages.sort((a, b) => a.timestamp - b.timestamp).map(m => ({ id: m.id, body: m.content, timestamp: m.timestamp, from: m.sender_id, to: m.chat_id, fromMe: m.from_me, type: m.type, hasMedia: m.has_media, mediaUrl: m.has_media ? `${process.env.API_URL || 'http://localhost:3000'}/media/${m.chat_id}/${m.id}` : null, mimeType: m.media_meta?.mimetype, ack: m.ack }))
+        res.json({ success: true, messages: formattedMsgs, hasMore: (offset + limit) < count, total: count })
+    } catch (error) { res.status(500).json({ success: false, messages: [] }) }
+})
+
+app.get("/media/:chatId/:messageId", async (req, res) => { /* ... lógica de mídia ... */ 
+    const { chatId, messageId } = req.params
+    if (chatId.includes("@g.us")) return res.status(403).send("Bloqueado")
+    try {
+        const { data: msg } = await supabase.from('messages').select('media_meta, type').eq('id', messageId).single()
+        if (!msg?.media_meta) return res.status(404).send("Mídia não encontrada")
+        const meta = msg.media_meta
+        const mediaMessage = { url: meta.url, mediaKey: meta.mediaKey ? Buffer.from(meta.mediaKey, 'base64') : undefined, mimetype: meta.mimetype, fileEncSha256: meta.fileEncSha256 ? Buffer.from(meta.fileEncSha256, 'base64') : undefined, fileSha256: meta.fileSha256 ? Buffer.from(meta.fileSha256, 'base64') : undefined, fileLength: meta.fileLength, directPath: meta.directPath, iv: meta.iv ? Buffer.from(meta.iv, 'base64') : undefined }
+        const buffer = await downloadMediaMessage({ key: { id: messageId }, message: { [msg.type + "Message"]: mediaMessage } }, 'buffer', {}, { logger: pino({ level: "silent" }), reuploadRequest: sock.updateMediaMessage })
+        res.set("Content-Type", meta.mimetype)
+        res.send(buffer)
+    } catch (error) { res.status(500).send("Erro mídia") }
+})
+
+app.post("/chats/send", async (req, res) => {
+    const { chatId, message } = req.body
+    if (chatId?.includes("@g.us")) return res.status(403).json({ success: false })
+    if (!connectionStatus.connected || !sock) return res.status(400).json({ success: false })
+    try {
+        const result = await sock.sendMessage(chatId, { text: message })
+        res.json({ success: true, messageId: result?.key?.id })
+    } catch (error) { res.status(500).json({ success: false, error: error.message }) }
+})
+
 app.post("/logout", async (req, res) => {
     try {
         if (sock) await sock.logout()
+        connectionStatus.connected = false
         await updateStatusInDb("disconnected", null, null)
         res.json({ success: true })
     } catch (err) { res.status(500).json({ success: false }) }
