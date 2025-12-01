@@ -94,18 +94,22 @@ function prepareMessageForDB(msg, chatId) {
     let mediaMeta = null
 
     if (hasMedia) {
-        const messageContent = msg.message[type + "Message"]
-        if (messageContent) {
-            mediaMeta = {
-                url: messageContent.url,
-                mediaKey: messageContent.mediaKey ? Buffer.from(messageContent.mediaKey).toString('base64') : null,
-                mimetype: messageContent.mimetype,
-                fileEncSha256: messageContent.fileEncSha256 ? Buffer.from(messageContent.fileEncSha256).toString('base64') : null,
-                fileSha256: messageContent.fileSha256 ? Buffer.from(messageContent.fileSha256).toString('base64') : null,
-                fileLength: messageContent.fileLength,
-                directPath: messageContent.directPath,
-                iv: messageContent.iv ? Buffer.from(messageContent.iv).toString('base64') : null,
+        try {
+            const messageContent = msg.message[type + "Message"]
+            if (messageContent) {
+                mediaMeta = {
+                    url: messageContent.url,
+                    mediaKey: messageContent.mediaKey ? Buffer.from(messageContent.mediaKey).toString('base64') : null,
+                    mimetype: messageContent.mimetype,
+                    fileEncSha256: messageContent.fileEncSha256 ? Buffer.from(messageContent.fileEncSha256).toString('base64') : null,
+                    fileSha256: messageContent.fileSha256 ? Buffer.from(messageContent.fileSha256).toString('base64') : null,
+                    fileLength: messageContent.fileLength,
+                    directPath: messageContent.directPath,
+                    iv: messageContent.iv ? Buffer.from(messageContent.iv).toString('base64') : null,
+                }
             }
+        } catch (e) {
+            // Ignora erro de parsing de mídia para não travar o lote
         }
     }
 
@@ -137,9 +141,6 @@ async function startWhatsApp(isManualStart = false) {
         return;
     }
 
-    // 🛑 LÓGICA DE ESPERA:
-    // Se não for manual e não tiver sessão, NÃO INICIA O BAILEYS.
-    // O Express continuará rodando esperando o clique no frontend.
     const hasAuthInfo = fs.existsSync("./auth_info/creds.json");
     if (!isManualStart && !hasAuthInfo) {
         console.log("[WHATSAPP] 🛑 Modo de Espera: Aguardando solicitação de QR Code...");
@@ -190,16 +191,17 @@ async function startWhatsApp(isManualStart = false) {
             contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
         })
 
-        // --- SINCRONIZAÇÃO EM LOTES (Evita Crash) ---
+        // --- SINCRONIZAÇÃO EM LOTES COM LIMPEZA DE RAM ---
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
-            console.log(`[SYNC] 🌊 Importando histórico...`)
-            if (qrTimeout) clearTimeout(qrTimeout); // Conectou, cancela timeout
+            console.log(`[SYNC] 🌊 Recebido: ${chats.length} chats, ${messages.length} msgs. Iniciando Pipeline...`)
+            if (qrTimeout) clearTimeout(qrTimeout);
 
+            // 1. Contatos (Leve)
             if (contacts) {
                 contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
             }
 
-            const privateChats = chats.filter(c => !c.id.includes("@g.us"));
+            // Mapa de Datas (Necessário para ordenação)
             const lastMsgMap = {};
             messages.forEach(msg => {
                 const jid = msg.key.remoteJid;
@@ -207,9 +209,13 @@ async function startWhatsApp(isManualStart = false) {
                 if (!lastMsgMap[jid] || ts > lastMsgMap[jid]) lastMsgMap[jid] = ts;
             });
 
-            // Processa chats em lotes de 50
-            for (let i = 0; i < privateChats.length; i += 50) {
-                const batch = privateChats.slice(i, i + 50).map(c => {
+            // --- 2. PIPELINE DE CHATS ---
+            const privateChats = chats.filter(c => !c.id.includes("@g.us"));
+            const CHAT_BATCH_SIZE = 50;
+            
+            for (let i = 0; i < privateChats.length; i += CHAT_BATCH_SIZE) {
+                // Fatia o array (Slice)
+                let batch = privateChats.slice(i, i + CHAT_BATCH_SIZE).map(c => {
                     let timestamp = lastMsgMap[c.id] || (c.conversationTimestamp ? Number(c.conversationTimestamp) : 0);
                     if (timestamp > 0 && timestamp < 946684800000) timestamp = timestamp * 1000;
                     if (timestamp === 0) timestamp = 1000; 
@@ -223,35 +229,71 @@ async function startWhatsApp(isManualStart = false) {
                         last_message_time: timestamp, 
                     };
                 });
-                await supabase.from("chats").upsert(batch, { onConflict: 'id' });
-                await new Promise(r => setTimeout(r, 50)); 
-            }
 
-            // Processa mensagens em lotes de 100
-            const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
-            for (let i = 0; i < privateMessages.length; i += 100) {
-                const batch = privateMessages.slice(i, i + 100).map(m => prepareMessageForDB(m, m.key.remoteJid));
-                await supabase.from("messages").upsert(batch, { onConflict: 'id' });
+                // Envia para o banco
+                const { error } = await supabase.from("chats").upsert(batch, { onConflict: 'id' });
+                if (error) console.error(`[SYNC] Erro Chats Lote ${i}:`, error.message);
+                
+                // Limpeza de Memória
+                batch = null; 
+                
+                // Pausa para o Event Loop respirar e responder Health Checks
                 await new Promise(r => setTimeout(r, 100));
             }
+            console.log(`[SYNC] Chats processados.`);
+
+            // --- 3. PIPELINE DE MENSAGENS (O Mais Pesado) ---
+            // Primeiro filtramos para não perder tempo com lixo
+            const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
+            const MSG_BATCH_SIZE = 100;
+
+            for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
+                // Fatia o array
+                let batch = privateMessages.slice(i, i + MSG_BATCH_SIZE).map(m => prepareMessageForDB(m, m.key.remoteJid));
+                
+                // Envia para o banco
+                const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' });
+                if (error) console.error(`[SYNC] Erro Msgs Lote ${i}:`, error.message);
+                
+                // Log de progresso a cada 1000
+                if (i % 1000 === 0 && i > 0) console.log(`[SYNC] Progresso: ${i}/${privateMessages.length} msgs salvas.`);
+
+                // LIMPEZA DE MEMÓRIA CRÍTICA
+                batch = null; // Libera o array processado
+                if (global.gc && i % 1000 === 0) {
+                    global.gc(); // Força Garbage Collector se disponível (a cada 10 lotes)
+                }
+
+                // Pausa para evitar CPU 100%
+                await new Promise(r => setTimeout(r, 150));
+            }
             
+            // Marca como conectado no final
             await updateStatusInDb("connected", null, sock?.user?.id)
-            console.log("[SYNC] ✅ Sincronização Completa.")
+            
+            console.log("[SYNC] ✅ Sincronização COMPLETA.")
+            
+            // Limpeza final
             if (global.gc) global.gc()
         })
 
+        // Eventos Tempo Real
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
             if (type !== "notify" && type !== "append") return
             for (const msg of messages) {
                 const chatId = msg.key.remoteJid
                 if (!chatId || chatId.includes("@g.us") || chatId === "status@broadcast") continue
+
                 const msgDB = prepareMessageForDB(msg, chatId)
                 await supabase.from("messages").upsert(msgDB)
+
                 const updateData = {
                     last_message: getMessageText(msg),
                     last_message_time: Number(msg.messageTimestamp) * 1000
                 }
-                if (!contactStore[chatId] && msg.pushName) updateData.name = msg.pushName
+                if (!contactStore[chatId] && msg.pushName) {
+                    updateData.name = msg.pushName
+                }
                 await supabase.from("chats").update(updateData).eq("id", chatId)
             }
         })
@@ -304,7 +346,7 @@ async function startWhatsApp(isManualStart = false) {
     }
 }
 
-// Tenta iniciar se já tiver sessão, senão fica parado esperando comando
+// Inicia em modo de espera
 startWhatsApp(false);
 
 const handleShutdown = async (signal) => {
@@ -317,12 +359,9 @@ const handleShutdown = async (signal) => {
 process.on('SIGINT', () => handleShutdown('SIGINT'));
 process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
-// --- ROTAS ---
+// --- ROTAS HTTP ---
 
-// ✅ ROTA RAIZ: ISSO IMPEDE O RENDER DE MATAR SEU SERVIDOR
-app.get("/", (req, res) => {
-    res.send("Backend WhatsApp Online 🚀");
-});
+app.get("/", (req, res) => res.send("WhatsApp API Online 🚀")); // Rota Health Check
 
 app.post("/session/connect", async (req, res) => {
     console.log("[API] Solicitando conexão manual...");
@@ -350,9 +389,8 @@ app.get("/qr", (req, res) => {
     return res.send(lastQrDataUrl)
 })
 
-// ... Rotas de chats, messages, media ... (COPIE AS MESMAS DO ANTERIOR AQUI)
-// Resumindo para caber na resposta:
-app.get("/chats", async (req, res) => { /* ... lógica de chats com range e order ... */ 
+// ... Rotas de chats, messages, media ... (Mesmas de sempre)
+app.get("/chats", async (req, res) => { 
     const limit = Number(req.query.limit) || 20
     const offset = Number(req.query.offset) || 0
     try {
@@ -360,8 +398,8 @@ app.get("/chats", async (req, res) => { /* ... lógica de chats com range e orde
         if (error) throw error
         if (connectionStatus.connected && sock) {
             const chatsMissingPic = chats.filter(c => !c.image_url);
-            await Promise.allSettled(chatsMissingPic.map(async (c) => {
-                try { const url = await sock.profilePictureUrl(c.id, "image"); if (url) { c.image_url = url; await supabase.from("chats").update({ image_url: url }).eq("id", c.id) } } catch (e) {}
+            Promise.allSettled(chatsMissingPic.map(async (c) => {
+                try { const url = await sock.profilePictureUrl(c.id, "image"); if (url) { await supabase.from("chats").update({ image_url: url }).eq("id", c.id) } } catch (e) {}
             }))
         }
         const formattedChats = chats.map(c => ({ id: c.id, name: c.name, pictureUrl: c.image_url, lastMessage: c.last_message || "", lastMessageTime: c.last_message_time, unreadCount: c.unread_count, isGroup: false }))
@@ -369,7 +407,7 @@ app.get("/chats", async (req, res) => { /* ... lógica de chats com range e orde
     } catch (error) { res.status(500).json({ success: false, chats: [] }) }
 })
 
-app.get("/chats/:chatId/messages", async (req, res) => { /* ... lógica de msgs ... */ 
+app.get("/chats/:chatId/messages", async (req, res) => { 
     const { chatId } = req.params
     const limit = Number(req.query.limit) || 20
     const offset = Number(req.query.offset) || 0
@@ -382,7 +420,7 @@ app.get("/chats/:chatId/messages", async (req, res) => { /* ... lógica de msgs 
     } catch (error) { res.status(500).json({ success: false, messages: [] }) }
 })
 
-app.get("/media/:chatId/:messageId", async (req, res) => { /* ... lógica de mídia ... */ 
+app.get("/media/:chatId/:messageId", async (req, res) => { 
     const { chatId, messageId } = req.params
     if (chatId.includes("@g.us")) return res.status(403).send("Bloqueado")
     try {
@@ -404,15 +442,6 @@ app.post("/chats/send", async (req, res) => {
         const result = await sock.sendMessage(chatId, { text: message })
         res.json({ success: true, messageId: result?.key?.id })
     } catch (error) { res.status(500).json({ success: false, error: error.message }) }
-})
-
-app.post("/logout", async (req, res) => {
-    try {
-        if (sock) await sock.logout()
-        connectionStatus.connected = false
-        await updateStatusInDb("disconnected", null, null)
-        res.json({ success: true })
-    } catch (err) { res.status(500).json({ success: false }) }
 })
 
 const PORT = process.env.PORT || 3000
