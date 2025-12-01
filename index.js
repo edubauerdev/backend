@@ -18,7 +18,7 @@ const fs = require('fs')
 const app = express()
 app.use(cors())
 
-// AJUSTE DE LIMITE DE PAYLOAD
+// Aumentando limite de payload
 app.use(express.json({ limit: '50mb' }))
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
@@ -230,7 +230,7 @@ async function startWhatsApp(isManualStart = false) {
                     const updateData = chatUpdateMap[c.id];
                     
                     let timestamp = updateData ? updateData.ts : (c.conversationTimestamp ? Number(c.conversationTimestamp) : 0);
-                    let lastMsg = updateData ? updateData.body : ""; // Pega o texto!
+                    let lastMsg = updateData ? updateData.body : ""; // Pega o texto do mapa!
 
                     // Correções de data
                     if (timestamp > 0 && timestamp < 946684800000) timestamp = timestamp * 1000;
@@ -243,7 +243,7 @@ async function startWhatsApp(isManualStart = false) {
                         is_group: false,
                         is_archived: c.archived || false,
                         last_message_time: timestamp, 
-                        last_message: lastMsg, // Agora populamos corretamente!
+                        last_message: lastMsg, // ✅ Agora populado corretamente
                     };
                 });
 
@@ -258,6 +258,8 @@ async function startWhatsApp(isManualStart = false) {
             // --- 3. PIPELINE DE MENSAGENS ---
             const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
             const MSG_BATCH_SIZE = 50;
+
+            console.log(`[SYNC] Processando ${privateMessages.length} mensagens...`);
 
             for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
                 let batch = privateMessages.slice(i, i + MSG_BATCH_SIZE).map(m => prepareMessageForDB(m, m.key.remoteJid));
@@ -362,7 +364,7 @@ process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
 // --- ROTAS HTTP ---
 
-app.get("/", (req, res) => res.send("WhatsApp API Online 🚀")); // Rota Health Check
+app.get("/", (req, res) => res.send("WhatsApp API Online 🚀")); 
 
 app.post("/session/connect", async (req, res) => {
     console.log("[API] Solicitando conexão manual...");
