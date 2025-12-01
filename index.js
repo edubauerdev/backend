@@ -18,7 +18,7 @@ const fs = require('fs')
 const app = express()
 app.use(cors())
 
-// Aumentando limite de payload para garantir recebimento de mídias grandes
+// AJUSTE DE LIMITE DE PAYLOAD
 app.use(express.json({ limit: '50mb' }))
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
@@ -165,7 +165,7 @@ async function startWhatsApp(isManualStart = false) {
                 keys: makeCacheableSignalKeyStore(state.keys, logger),
             },
             browser: ["WhatsApp Backend", "Chrome", "1.0.0"],
-            syncFullHistory: true, // IMPORTANTE: TRUE para pegar o histórico
+            syncFullHistory: true,
             generateHighQualityLinkPreview: true,
             connectTimeoutMs: 60000, 
             keepAliveIntervalMs: 10000,
@@ -191,7 +191,7 @@ async function startWhatsApp(isManualStart = false) {
             contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
         })
 
-        // --- SINCRONIZAÇÃO EM LOTES COM LIMPEZA DE RAM ---
+        // --- SINCRONIZAÇÃO EM LOTES (PIPELINE) ---
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
             console.log(`[SYNC] 🌊 Recebido: ${chats.length} chats, ${messages.length} msgs. Iniciando Pipeline...`)
             if (qrTimeout) clearTimeout(qrTimeout);
@@ -201,24 +201,38 @@ async function startWhatsApp(isManualStart = false) {
                 contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
             }
 
-            // Mapa de Datas (Necessário para ordenação)
-            const lastMsgMap = {};
+            // 🔥 CORREÇÃO AQUI: Mapeia DATA e CONTEÚDO da última mensagem
+            const chatUpdateMap = {};
+            
             messages.forEach(msg => {
                 const jid = msg.key.remoteJid;
                 const ts = Number(msg.messageTimestamp);
-                if (!lastMsgMap[jid] || ts > lastMsgMap[jid]) lastMsgMap[jid] = ts;
+                const body = getMessageText(msg); // Extrai o texto aqui!
+
+                // Se for mais recente, atualiza o mapa
+                if (!chatUpdateMap[jid] || ts > chatUpdateMap[jid].ts) {
+                    chatUpdateMap[jid] = {
+                        ts: ts,
+                        body: body
+                    };
+                }
             });
 
             // --- 2. PIPELINE DE CHATS ---
             const privateChats = chats.filter(c => !c.id.includes("@g.us"));
-            const CHAT_BATCH_SIZE = 25; // Lotes pequenos para segurança
+            const CHAT_BATCH_SIZE = 25;
             
-            console.log(`[SYNC] Processando ${privateChats.length} chats em lotes de ${CHAT_BATCH_SIZE}...`);
+            console.log(`[SYNC] Processando ${privateChats.length} chats...`);
 
             for (let i = 0; i < privateChats.length; i += CHAT_BATCH_SIZE) {
-                // Fatia o array (Slice)
                 let batch = privateChats.slice(i, i + CHAT_BATCH_SIZE).map(c => {
-                    let timestamp = lastMsgMap[c.id] || (c.conversationTimestamp ? Number(c.conversationTimestamp) : 0);
+                    // Pega os dados do mapa que criamos acima
+                    const updateData = chatUpdateMap[c.id];
+                    
+                    let timestamp = updateData ? updateData.ts : (c.conversationTimestamp ? Number(c.conversationTimestamp) : 0);
+                    let lastMsg = updateData ? updateData.body : ""; // Pega o texto!
+
+                    // Correções de data
                     if (timestamp > 0 && timestamp < 946684800000) timestamp = timestamp * 1000;
                     if (timestamp === 0) timestamp = 1000; 
 
@@ -229,6 +243,7 @@ async function startWhatsApp(isManualStart = false) {
                         is_group: false,
                         is_archived: c.archived || false,
                         last_message_time: timestamp, 
+                        last_message: lastMsg, // Agora populamos corretamente!
                     };
                 });
 
@@ -236,48 +251,30 @@ async function startWhatsApp(isManualStart = false) {
                 const { error } = await supabase.from("chats").upsert(batch, { onConflict: 'id' });
                 if (error) console.error(`[SYNC] Erro Chats Lote ${i}:`, error.message);
                 
-                // Limpeza de Memória
                 batch = null; 
-                
-                // Pausa para o Event Loop respirar e responder Health Checks
-                await new Promise(r => setTimeout(r, 150));
+                await new Promise(r => setTimeout(r, 100)); 
             }
-            console.log(`[SYNC] Chats processados.`);
 
-            // --- 3. PIPELINE DE MENSAGENS (O Mais Pesado) ---
-            // Primeiro filtramos para não perder tempo com lixo
+            // --- 3. PIPELINE DE MENSAGENS ---
             const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
-            const MSG_BATCH_SIZE = 50; // Lotes pequenos para segurança
-
-            console.log(`[SYNC] Processando ${privateMessages.length} mensagens em lotes de ${MSG_BATCH_SIZE}...`);
+            const MSG_BATCH_SIZE = 50;
 
             for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
-                // Fatia o array
                 let batch = privateMessages.slice(i, i + MSG_BATCH_SIZE).map(m => prepareMessageForDB(m, m.key.remoteJid));
                 
-                // Envia para o banco
                 const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' });
                 if (error) console.error(`[SYNC] Erro Msgs Lote ${i}:`, error.message);
                 
-                // Log de progresso a cada 500
-                if (i % 500 === 0 && i > 0) console.log(`[SYNC] Progresso: ${i}/${privateMessages.length} msgs salvas.`);
+                if (i % 500 === 0 && i > 0) console.log(`[SYNC] Progresso: ${i}/${privateMessages.length} msgs.`);
 
-                // LIMPEZA DE MEMÓRIA CRÍTICA
-                batch = null; // Libera o array processado
-                if (global.gc && i % 1000 === 0) {
-                    global.gc(); // Força Garbage Collector se disponível
-                }
+                batch = null; 
+                if (global.gc && i % 1000 === 0) global.gc();
 
-                // Pausa maior para mensagens pesadas
-                await new Promise(r => setTimeout(r, 200));
+                await new Promise(r => setTimeout(r, 200)); 
             }
             
-            // Marca como conectado no final
             await updateStatusInDb("connected", null, sock?.user?.id)
-            
             console.log("[SYNC] ✅ Sincronização COMPLETA.")
-            
-            // Limpeza final
             if (global.gc) global.gc()
         })
 
@@ -460,16 +457,12 @@ app.get("/media/:chatId/:messageId", async (req, res) => {
 
 app.post("/chats/send", async (req, res) => {
     const { chatId, message } = req.body
-    if (chatId?.includes("@g.us")) return res.status(403).json({ success: false })
     if (!connectionStatus.connected || !sock) return res.status(400).json({ success: false })
     try {
         const result = await sock.sendMessage(chatId, { text: message })
         res.json({ success: true, messageId: result?.key?.id })
     } catch (error) { res.status(500).json({ success: false, error: error.message }) }
 })
-
-
-//
 
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => console.log(`[SERVER] 🌐 Porta ${PORT}`))
