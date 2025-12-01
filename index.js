@@ -32,7 +32,7 @@ if (!supabaseUrl || !supabaseKey) {
 
 const supabase = createClient(supabaseUrl, supabaseKey)
 
-// ESTADO LOCAL (Mantido apenas para /health rápido, mas a verdade está no banco)
+// ESTADO
 let sock = null
 let isStarting = false
 let lastQrDataUrl = null
@@ -42,16 +42,17 @@ const connectionStatus = {
     status: "disconnected",
 }
 
+// Store local apenas para contatos
 let contactStore = {}
 
-// --- FUNÇÃO DE STATUS DO BANCO (ESSENCIAL) ---
+// --- FUNÇÃO DE STATUS DO BANCO ---
 async function updateStatusInDb(status, qrCode = null, phone = null) {
     try {
         console.log(`[DB] Atualizando status para: ${status}`)
         const { error } = await supabase.from("instance_settings").upsert({
-            id: 1, // ID fixo para a instância
+            id: 1,
             status: status,
-            qr_code: qrCode, // Salva o QR Code no banco para o front ler
+            qr_code: qrCode,
             phone: phone,
             updated_at: new Date()
         })
@@ -166,6 +167,16 @@ async function startWhatsApp() {
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
             console.log(`[SYNC] 🌊 Recebendo histórico: ${chats.length} chats, ${messages.length} msgs.`)
 
+            // Mapa para encontrar a data mais recente REAL de cada chat
+            const lastMsgMap = {};
+            messages.forEach(msg => {
+                const jid = msg.key.remoteJid;
+                const ts = Number(msg.messageTimestamp);
+                if (!lastMsgMap[jid] || ts > lastMsgMap[jid]) {
+                    lastMsgMap[jid] = ts;
+                }
+            });
+
             if (contacts) {
                 contacts.forEach(c => {
                     if (c.name) contactStore[c.id] = c.name
@@ -173,15 +184,37 @@ async function startWhatsApp() {
             }
 
             const privateChats = chats.filter(c => !c.id.includes("@g.us"));
+            
             if (privateChats.length > 0) {
-                const chatsBatch = privateChats.map(c => ({
-                    id: c.id,
-                    name: resolveChatName(c.id, c.name, null), 
-                    unread_count: c.unreadCount || 0,
-                    is_group: false,
-                    is_archived: c.archived || false,
-                    last_message_time: c.conversationTimestamp ? Number(c.conversationTimestamp) * 1000 : Date.now(),
-                }))
+                const chatsBatch = privateChats.map(c => {
+                    // LÓGICA DE CORREÇÃO DE DATA 🕒
+                    let timestamp = 0;
+                    
+                    if (lastMsgMap[c.id]) {
+                        timestamp = lastMsgMap[c.id];
+                    } else if (c.conversationTimestamp) {
+                        timestamp = Number(c.conversationTimestamp);
+                    }
+
+                    // Corrige segundos para ms se necessário
+                    if (timestamp > 0 && timestamp < 946684800000) {
+                        timestamp = timestamp * 1000;
+                    }
+                    
+                    // Fallback para evitar data zerada no topo
+                    if (timestamp === 0) {
+                        timestamp = c.unreadCount > 0 ? Date.now() : 1000; 
+                    }
+
+                    return {
+                        id: c.id,
+                        name: resolveChatName(c.id, c.name, null), 
+                        unread_count: c.unreadCount || 0,
+                        is_group: false,
+                        is_archived: c.archived || false,
+                        last_message_time: timestamp, 
+                    };
+                })
 
                 for (let i = 0; i < chatsBatch.length; i += 100) {
                     const batch = chatsBatch.slice(i, i + 100)
@@ -200,7 +233,6 @@ async function startWhatsApp() {
                 }
             }
             
-            // 🔥 Assim que sincroniza, confirma conexão no banco
             await updateStatusInDb("connected", null, sock?.user?.id)
             
             console.log("[SYNC] ✅ Concluído.")
@@ -227,11 +259,9 @@ async function startWhatsApp() {
             }
         })
 
-        // --- CONEXÃO E STATUS (AQUI O MÁGICA ACONTECE) ---
         sock.ev.on("connection.update", async (update) => {
             const { connection, lastDisconnect, qr } = update
             
-            // 1. Gerou QR Code -> Envia para o Banco
             if (qr) {
                 lastQrDataUrl = await qrcode.toDataURL(qr)
                 connectionStatus.status = "qr"
@@ -239,7 +269,6 @@ async function startWhatsApp() {
                 await updateStatusInDb("qr", lastQrDataUrl, null)
             }
             
-            // 2. Conectou -> Envia para o Banco
             if (connection === "open") {
                 connectionStatus.connected = true
                 connectionStatus.phone = sock.user?.id
@@ -249,7 +278,6 @@ async function startWhatsApp() {
                 await updateStatusInDb("connected", null, sock.user?.id)
             }
             
-            // 3. Desconectou -> Envia para o Banco
             if (connection === "close") {
                 const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
                 connectionStatus.connected = false
@@ -277,7 +305,34 @@ async function startWhatsApp() {
 
 startWhatsApp()
 
-// --- ROTAS ---
+// --- 🛑 GRACEFUL SHUTDOWN (NOVO!) ---
+// Captura sinais de desligamento do Render/Sistema e atualiza o banco antes de morrer.
+
+const handleShutdown = async (signal) => {
+    console.log(`[SERVER] 🛑 Recebido sinal de desligamento: ${signal}`);
+    try {
+        // 1. Atualiza status no banco para 'disconnected'
+        console.log("[DB] Atualizando status para desconectado...");
+        await updateStatusInDb("disconnected", null, null);
+        
+        // 2. Fecha conexão do Baileys corretamente
+        if (sock) {
+            sock.end(undefined);
+        }
+        console.log("[SERVER] Desligamento concluído.");
+    } catch (err) {
+        console.error("[SERVER] Erro durante desligamento:", err);
+    } finally {
+        process.exit(0);
+    }
+};
+
+// Escuta sinais de encerramento do sistema (Ctrl+C ou Render Stopping)
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+
+
+// --- ROTAS HTTP ---
 
 app.get("/health", (req, res) => res.json({ ok: true, status: connectionStatus }))
 
@@ -404,14 +459,13 @@ app.post("/chats/send", async (req, res) => {
     try {
         const result = await sock.sendMessage(chatId, { text: message })
         res.json({ success: true, messageId: result?.key?.id })
-    } catch (error) { res.status(500).json({ success: false }) }
+    } catch (error) { res.status(500).json({ success: false, error: error.message }) }
 })
 
 app.post("/logout", async (req, res) => {
     try {
         if (sock) await sock.logout()
         connectionStatus.connected = false
-        // Força desconexão no banco
         await updateStatusInDb("disconnected", null, null)
         res.json({ success: true })
     } catch (err) { res.status(500).json({ success: false }) }
