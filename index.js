@@ -11,7 +11,6 @@ const {
     DisconnectReason,
     makeCacheableSignalKeyStore,
     downloadMediaMessage,
-    jidNormalizedUser
 } = require("@whiskeysockets/baileys")
 const qrcode = require("qrcode")
 const fs = require('fs')
@@ -19,9 +18,11 @@ const fs = require('fs')
 const app = express()
 app.use(cors())
 
+// Aumentando limite de payload
 app.use(express.json({ limit: '50mb' }))
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
+// CONFIGURAÇÃO SUPABASE
 const supabaseUrl = process.env.SUPABASE_URL
 const supabaseKey = process.env.SUPABASE_KEY
 
@@ -34,6 +35,7 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
     auth: { persistSession: false }
 })
 
+// ESTADO
 let sock = null
 let isStarting = false
 let lastQrDataUrl = null
@@ -45,31 +47,24 @@ const connectionStatus = {
     status: "disconnected",
 }
 
-// Store agora mapeia "NUMERO" -> "NOME" (ex: "551199999999" -> "Mãe")
 let contactStore = {}
 
+// --- FUNÇÃO DE STATUS DO BANCO ---
 async function updateStatusInDb(status, qrCode = null, phone = null) {
     try {
         console.log(`[DB] Atualizando status para: ${status}`)
-        await supabase.from("instance_settings").upsert({
+        const { error } = await supabase.from("instance_settings").upsert({
             id: 1,
             status: status,
             qr_code: qrCode,
             phone: phone,
             updated_at: new Date()
         })
+        if (error) console.error("[DB] Erro status:", error.message)
     } catch (err) { console.error("[DB] Erro:", err) }
 }
 
 // --- FUNÇÕES AUXILIARES ---
-
-// 🔥 NOVA FUNÇÃO: Extrai apenas o número de telefone de qualquer ID
-function extractPhoneNumber(jid) {
-    if (!jid) return "";
-    // Remove sufixos como @s.whatsapp.net ou @lid e portas :12
-    return jid.split('@')[0].split(':')[0];
-}
-
 function getMessageText(msg) {
     if (!msg || !msg.message) return ""
     const content = msg.message
@@ -130,28 +125,18 @@ function prepareMessageForDB(msg, chatId) {
     }
 }
 
-// 🔥 RESOLUÇÃO DE NOME BASEADA NO TELEFONE (Mais robusta)
 function resolveChatName(chatId, chatName, pushName) {
-    const phone = extractPhoneNumber(chatId);
-    
-    // 1. Busca pelo número limpo na agenda
-    if (contactStore[phone]) return contactStore[phone];
-    
-    // 2. Nome que veio no chat
+    if (contactStore[chatId]) return contactStore[chatId];
     if (chatName) return chatName;
-    
-    // 3. Nome público
     if (pushName) return pushName;
-    
-    // 4. Retorna o número
-    return phone;
+    return chatId.split('@')[0];
 }
 
+// --- WHATSAPP START ---
 async function startWhatsApp(isManualStart = false) {
     if (sock?.user || isStarting) return;
 
     const hasAuthInfo = fs.existsSync("./auth_info/creds.json");
-    
     if (!isManualStart && !hasAuthInfo) {
         console.log("[WHATSAPP] 🛑 Modo de Espera.");
         await updateStatusInDb("disconnected", null, null);
@@ -195,54 +180,43 @@ async function startWhatsApp(isManualStart = false) {
             }, 5 * 60 * 1000);
         }
 
-        // --- ATUALIZAÇÃO DE CONTATOS ---
         sock.ev.on("contacts.upsert", (contacts) => {
-            contacts.forEach(c => { 
-                if (c.name) {
-                    // Salva mapeando pelo NÚMERO LIMPO
-                    const phone = extractPhoneNumber(c.id);
-                    contactStore[phone] = c.name;
-                }
-            })
+            contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
         })
 
-        // --- PIPELINE DE DADOS ---
+        // --- SINCRONIZAÇÃO EM LOTES (PIPELINE PURO) ---
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
             console.log(`[SYNC] 🌊 Recebido: ${chats.length} chats, ${messages.length} msgs.`)
             if (qrTimeout) clearTimeout(qrTimeout);
 
-            // 1. Popula contatos na memória (Pelo número limpo)
+            // 1. Carrega contatos (Rápido)
             if (contacts) {
-                contacts.forEach(c => { 
-                    if (c.name) {
-                        const phone = extractPhoneNumber(c.id);
-                        contactStore[phone] = c.name;
-                    }
-                })
+                contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
             }
 
-            // 2. PIPELINE DE CHATS
+            // 2. PIPELINE DE CHATS (Primeiro popula os chats)
             const privateChats = chats.filter(c => !c.id.includes("@g.us"));
             const CHAT_BATCH_SIZE = 25;
             
-            console.log(`[SYNC] Salvando ${privateChats.length} chats (com phone e name)...`);
+            console.log(`[SYNC] Salvando ${privateChats.length} chats...`);
 
+            // Loop sequencial para chats
             for (let i = 0; i < privateChats.length; i += CHAT_BATCH_SIZE) {
                 let batch = privateChats.slice(i, i + CHAT_BATCH_SIZE).map(c => {
+                    // Apenas converte a data do chat (se existir)
                     let timestamp = c.conversationTimestamp ? Number(c.conversationTimestamp) : 0;
                     if (timestamp > 0 && timestamp < 946684800000) timestamp = timestamp * 1000;
                     if (timestamp === 0) timestamp = 1000; 
-                    
-                    const phone = extractPhoneNumber(c.id);
 
                     return {
                         id: c.id,
-                        phone: phone, // 🔥 NOVA COLUNA
-                        name: resolveChatName(c.id, c.name, null), // 🔥 NOME RESOLVIDO CORRETAMENTE
+                        phone: c.id.split('@')[0], // Mapeando coluna telefone
+                        name: resolveChatName(c.id, c.name, null), 
                         unread_count: c.unreadCount || 0,
                         is_group: false,
                         is_archived: c.archived || false,
                         last_message_time: timestamp, 
+                        // last_message vai vazio (null) por enquanto
                     };
                 });
 
@@ -252,8 +226,9 @@ async function startWhatsApp(isManualStart = false) {
                 batch = null; 
                 await new Promise(r => setTimeout(r, 100)); 
             }
+            console.log("[SYNC] ✅ Chats finalizados. Iniciando mensagens...");
 
-            // 3. PIPELINE DE MENSAGENS
+            // 3. PIPELINE DE MENSAGENS (Só inicia após o loop de chats terminar)
             const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
             const MSG_BATCH_SIZE = 50;
 
@@ -272,13 +247,14 @@ async function startWhatsApp(isManualStart = false) {
 
                 await new Promise(r => setTimeout(r, 200)); 
             }
-            
+
+            // 4. FASE FINAL
             await updateStatusInDb("connected", null, sock?.user?.id)
             console.log("[SYNC] ✅ Sincronização COMPLETA.")
             if (global.gc) global.gc()
         })
 
-        // --- MENSAGENS EM TEMPO REAL ---
+        // Eventos Tempo Real
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
             if (type !== "notify" && type !== "append") return
             for (const msg of messages) {
@@ -286,25 +262,14 @@ async function startWhatsApp(isManualStart = false) {
                 if (!chatId || chatId.includes("@g.us") || chatId === "status@broadcast") continue
 
                 const msgDB = prepareMessageForDB(msg, chatId)
+                
+                // Salva a mensagem. O Trigger do banco atualiza o Chat.
                 await supabase.from("messages").upsert(msgDB)
 
-                // Atualiza Chat com nome se for novo
-                const phone = extractPhoneNumber(chatId);
-                const updateData = {
-                    last_message: getMessageText(msg),
-                    last_message_time: Number(msg.messageTimestamp) * 1000
+                // Se for número novo (não tem nome), tenta atualizar nome
+                if (!contactStore[chatId] && msg.pushName) {
+                     await supabase.from("chats").update({ name: msg.pushName }).eq("id", chatId)
                 }
-                
-                // Se chegou mensagem de alguém sem nome, tenta salvar o PushName
-                if (!contactStore[phone] && msg.pushName) {
-                    updateData.name = msg.pushName
-                }
-                
-                // Se o chat não existir (primeira msg), upsert garante criação
-                // Mas para update simples, usamos update.
-                // Idealmente, deveríamos fazer um upsert no chat aqui também para garantir.
-                // Vamos fazer um update simples para performance.
-                await supabase.from("chats").update(updateData).eq("id", chatId)
             }
         })
 
@@ -411,6 +376,7 @@ app.get("/chats/avatar/:chatId", async (req, res) => {
     } catch (error) { res.status(500).send("Erro interno"); }
 });
 
+// ... Rotas de chats, messages, media ...
 app.get("/chats", async (req, res) => { 
     const limit = Number(req.query.limit) || 20
     const offset = Number(req.query.offset) || 0
