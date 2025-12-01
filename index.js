@@ -167,7 +167,7 @@ async function startWhatsApp() {
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
             console.log(`[SYNC] 🌊 Recebendo histórico: ${chats.length} chats, ${messages.length} msgs.`)
 
-            // Mapa para encontrar a data mais recente REAL de cada chat
+            // 1. Mapeia a data da última mensagem REAL que veio neste pacote
             const lastMsgMap = {};
             messages.forEach(msg => {
                 const jid = msg.key.remoteJid;
@@ -187,23 +187,27 @@ async function startWhatsApp() {
             
             if (privateChats.length > 0) {
                 const chatsBatch = privateChats.map(c => {
-                    // LÓGICA DE CORREÇÃO DE DATA 🕒
+                    // LÓGICA DE CORREÇÃO DE DATA (RIGOROSA) 🕒
                     let timestamp = 0;
                     
+                    // Prioridade 1: Data da mensagem real baixada agora
                     if (lastMsgMap[c.id]) {
                         timestamp = lastMsgMap[c.id];
-                    } else if (c.conversationTimestamp) {
+                    } 
+                    // Prioridade 2: Metadado do chat
+                    else if (c.conversationTimestamp) {
                         timestamp = Number(c.conversationTimestamp);
                     }
 
-                    // Corrige segundos para ms se necessário
+                    // Correção: Se for segundos (menor que ano 2000), converte para ms
                     if (timestamp > 0 && timestamp < 946684800000) {
                         timestamp = timestamp * 1000;
                     }
                     
-                    // Fallback para evitar data zerada no topo
+                    // CORREÇÃO CRÍTICA: Se não achou data, define como 1000 (muito antigo)
+                    // NUNCA usa Date.now(), para não jogar chat vazio pro topo.
                     if (timestamp === 0) {
-                        timestamp = c.unreadCount > 0 ? Date.now() : 1000; 
+                        timestamp = 1000; 
                     }
 
                     return {
@@ -239,6 +243,7 @@ async function startWhatsApp() {
             if (global.gc) global.gc()
         })
 
+        // Eventos Tempo Real (Novas Mensagens sempre jogam pro topo)
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
             if (type !== "notify" && type !== "append") return
             for (const msg of messages) {
@@ -250,7 +255,8 @@ async function startWhatsApp() {
 
                 const updateData = {
                     last_message: getMessageText(msg),
-                    last_message_time: Number(msg.messageTimestamp) * 1000
+                    // Mensagem nova SEMPRE é o horário atual/da mensagem
+                    last_message_time: Number(msg.messageTimestamp) * 1000 
                 }
                 if (!contactStore[chatId] && msg.pushName) {
                     updateData.name = msg.pushName
@@ -305,29 +311,20 @@ async function startWhatsApp() {
 
 startWhatsApp()
 
-// --- 🛑 GRACEFUL SHUTDOWN (NOVO!) ---
-// Captura sinais de desligamento do Render/Sistema e atualiza o banco antes de morrer.
-
+// --- 🛑 GRACEFUL SHUTDOWN ---
 const handleShutdown = async (signal) => {
-    console.log(`[SERVER] 🛑 Recebido sinal de desligamento: ${signal}`);
+    console.log(`[SERVER] 🛑 Recebido sinal: ${signal}`);
     try {
-        // 1. Atualiza status no banco para 'disconnected'
-        console.log("[DB] Atualizando status para desconectado...");
         await updateStatusInDb("disconnected", null, null);
-        
-        // 2. Fecha conexão do Baileys corretamente
-        if (sock) {
-            sock.end(undefined);
-        }
-        console.log("[SERVER] Desligamento concluído.");
+        console.log("[DB] Status off.");
+        if (sock) sock.end(undefined);
     } catch (err) {
-        console.error("[SERVER] Erro durante desligamento:", err);
+        console.error("[SERVER] Erro off:", err);
     } finally {
         process.exit(0);
     }
 };
 
-// Escuta sinais de encerramento do sistema (Ctrl+C ou Render Stopping)
 process.on('SIGINT', () => handleShutdown('SIGINT'));
 process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
@@ -352,7 +349,7 @@ app.get("/chats", async (req, res) => {
             .select('*', { count: 'exact' })
             .eq('is_archived', false)
             .not('id', 'ilike', '%@g.us')
-            .order('last_message_time', { ascending: false })
+            .order('last_message_time', { ascending: false }) // ORDENAÇÃO PELO BANCO
             .range(offset, offset + limit - 1)
 
         if (error) throw error
