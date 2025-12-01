@@ -18,11 +18,9 @@ const fs = require('fs')
 const app = express()
 app.use(cors())
 
-// Aumentando limite de payload para garantir recebimento de mídias grandes
 app.use(express.json({ limit: '50mb' }))
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
-// CONFIGURAÇÃO SUPABASE
 const supabaseUrl = process.env.SUPABASE_URL
 const supabaseKey = process.env.SUPABASE_KEY
 
@@ -35,7 +33,6 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
     auth: { persistSession: false }
 })
 
-// ESTADO
 let sock = null
 let isStarting = false
 let lastQrDataUrl = null
@@ -47,29 +44,22 @@ const connectionStatus = {
     status: "disconnected",
 }
 
+// Armazena nomes da agenda em memória RAM para acesso rápido
 let contactStore = {}
 
-// GARANTE QUE A PASTA DE SESSÃO EXISTE
-if (!fs.existsSync('./auth_info')) {
-    fs.mkdirSync('./auth_info', { recursive: true });
-}
-
-// --- FUNÇÃO DE STATUS DO BANCO ---
 async function updateStatusInDb(status, qrCode = null, phone = null) {
     try {
         console.log(`[DB] Atualizando status para: ${status}`)
-        const { error } = await supabase.from("instance_settings").upsert({
+        await supabase.from("instance_settings").upsert({
             id: 1,
             status: status,
             qr_code: qrCode,
             phone: phone,
             updated_at: new Date()
         })
-        if (error) console.error("[DB] Erro status:", error.message)
     } catch (err) { console.error("[DB] Erro:", err) }
 }
 
-// --- FUNÇÕES AUXILIARES ---
 function getMessageText(msg) {
     if (!msg || !msg.message) return ""
     const content = msg.message
@@ -130,19 +120,25 @@ function prepareMessageForDB(msg, chatId) {
     }
 }
 
+// 🔥 FUNÇÃO CRÍTICA: RESOLUÇÃO DE NOME COM HIERARQUIA 🔥
 function resolveChatName(chatId, chatName, pushName) {
+    // 1. Ouro: Nome salvo na agenda do celular (Sync de Contatos)
     if (contactStore[chatId]) return contactStore[chatId];
+    
+    // 2. Prata: Nome que veio no objeto do chat
     if (chatName) return chatName;
+    
+    // 3. Bronze: Nome público que a pessoa usa (Notify)
     if (pushName) return pushName;
+    
+    // 4. Consolação: O número de telefone formatado
     return chatId.split('@')[0];
 }
 
-// --- WHATSAPP START ---
 async function startWhatsApp(isManualStart = false) {
     if (sock?.user || isStarting) return;
 
     const hasAuthInfo = fs.existsSync("./auth_info/creds.json");
-    
     if (!isManualStart && !hasAuthInfo) {
         console.log("[WHATSAPP] 🛑 Modo de Espera.");
         await updateStatusInDb("disconnected", null, null);
@@ -177,7 +173,7 @@ async function startWhatsApp(isManualStart = false) {
         if (isManualStart) {
             qrTimeout = setTimeout(async () => {
                 if (!sock?.user) {
-                    console.log("[TIMEOUT] ⏰ Tempo esgotado.");
+                    console.log("[TIMEOUT] ⏰ QR Expirado.");
                     try { sock.end(undefined); } catch (e) {}
                     sock = null;
                     isStarting = false;
@@ -186,20 +182,50 @@ async function startWhatsApp(isManualStart = false) {
             }, 5 * 60 * 1000);
         }
 
-        sock.ev.on("contacts.upsert", (contacts) => {
-            contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
+        // --- EVENTO DE CONTATOS (ATUALIZAÇÃO DA AGENDA) ---
+        sock.ev.on("contacts.upsert", async (contacts) => {
+            // 1. Atualiza memória RAM
+            contacts.forEach(c => {
+                if (c.name) {
+                    contactStore[c.id] = c.name;
+                }
+            });
+
+            // 2. Se tiver nome novo, atualiza o banco IMEDIATAMENTE
+            // Isso garante que se você renomear no celular, muda no sistema
+            const contactsToUpdate = contacts.filter(c => c.name);
+            if (contactsToUpdate.length > 0) {
+                // Processa em background para não travar
+                Promise.allSettled(contactsToUpdate.map(async (c) => {
+                    try {
+                         await supabase.from('chats').update({ name: c.name }).eq('id', c.id);
+                    } catch(e) {}
+                }));
+            }
         })
 
-        // --- SINCRONIZAÇÃO EM LOTES (PIPELINE) ---
+        // --- SINCRONIZAÇÃO DE HISTÓRICO ---
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
             console.log(`[SYNC] 🌊 Recebido: ${chats.length} chats, ${messages.length} msgs.`)
             if (qrTimeout) clearTimeout(qrTimeout);
 
+            // 1. PRIMEIRO DE TUDO: Salva os nomes da agenda na memória
+            // Isso é vital para que a próxima etapa (salvar chats) já use os nomes certos
             if (contacts) {
-                contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
+                console.log(`[SYNC] Carregando ${contacts.length} contatos da agenda...`);
+                contacts.forEach(c => { 
+                    if (c.name) contactStore[c.id] = c.name 
+                });
             }
 
-            // 1. CHATS (Lotes de 25)
+            const lastMsgMap = {};
+            messages.forEach(msg => {
+                const jid = msg.key.remoteJid;
+                const ts = Number(msg.messageTimestamp);
+                if (!lastMsgMap[jid] || ts > lastMsgMap[jid]) lastMsgMap[jid] = ts;
+            });
+
+            // 2. PIPELINE DE CHATS (Agora usando contactStore populado)
             const privateChats = chats.filter(c => !c.id.includes("@g.us"));
             const CHAT_BATCH_SIZE = 25;
             
@@ -207,18 +233,18 @@ async function startWhatsApp(isManualStart = false) {
 
             for (let i = 0; i < privateChats.length; i += CHAT_BATCH_SIZE) {
                 let batch = privateChats.slice(i, i + CHAT_BATCH_SIZE).map(c => {
-                    let timestamp = c.conversationTimestamp ? Number(c.conversationTimestamp) : 0;
+                    let timestamp = lastMsgMap[c.id] || (c.conversationTimestamp ? Number(c.conversationTimestamp) : 0);
                     if (timestamp > 0 && timestamp < 946684800000) timestamp = timestamp * 1000;
                     if (timestamp === 0) timestamp = 1000; 
 
                     return {
                         id: c.id,
+                        // 🔥 AQUI: Usa o nome da agenda se tiver, senão usa o do chat, senão formata
                         name: resolveChatName(c.id, c.name, null), 
                         unread_count: c.unreadCount || 0,
                         is_group: false,
                         is_archived: c.archived || false,
                         last_message_time: timestamp, 
-                        // last_message será preenchido automaticamente pelo Trigger do banco
                     };
                 });
 
@@ -229,7 +255,7 @@ async function startWhatsApp(isManualStart = false) {
                 await new Promise(r => setTimeout(r, 100)); 
             }
 
-            // 2. MENSAGENS (Lotes de 50)
+            // 3. PIPELINE DE MENSAGENS
             const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
             const MSG_BATCH_SIZE = 50;
 
@@ -262,8 +288,21 @@ async function startWhatsApp(isManualStart = false) {
                 if (!chatId || chatId.includes("@g.us") || chatId === "status@broadcast") continue
 
                 const msgDB = prepareMessageForDB(msg, chatId)
-                // Apenas salva a mensagem. O Trigger do banco atualiza o chat.
                 await supabase.from("messages").upsert(msgDB)
+
+                // Prepara update do chat
+                const updateData = {
+                    last_message: getMessageText(msg),
+                    last_message_time: Number(msg.messageTimestamp) * 1000
+                }
+                
+                // Tenta pegar nome do PushName se for mensagem nova de desconhecido
+                // Mas SÓ SE não tiver na agenda
+                if (!contactStore[chatId] && msg.pushName) {
+                    updateData.name = msg.pushName
+                }
+
+                await supabase.from("chats").update(updateData).eq("id", chatId)
             }
         })
 
@@ -318,7 +357,6 @@ async function startWhatsApp(isManualStart = false) {
 startWhatsApp(false);
 
 const handleShutdown = async (signal) => {
-    console.log(`[SERVER] 🛑 Shutdown: ${signal}`);
     try {
         await updateStatusInDb("disconnected", null, null);
         if (sock) sock.end(undefined);
@@ -357,27 +395,21 @@ app.get("/qr", (req, res) => {
     return res.send(lastQrDataUrl)
 })
 
-// ROTA PROXY DE AVATAR (O Backend baixa e entrega a imagem real)
 app.get("/chats/avatar/:chatId", async (req, res) => {
     const { chatId } = req.params;
     try {
         const url = await sock.profilePictureUrl(chatId, "image").catch(() => null);
         if (!url) return res.status(404).send("Sem foto");
-        
         const response = await fetch(url);
         if (!response.ok) return res.status(404).send("Erro baixar");
-        
-        const arrayBuffer = await response.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-        
+        const buffer = Buffer.from(await response.arrayBuffer());
         res.set("Content-Type", "image/jpeg");
         res.set("Cache-Control", "public, max-age=3600"); 
         res.send(buffer);
-    } catch (error) { 
-        res.status(500).send("Erro interno"); 
-    }
+    } catch (error) { res.status(500).send("Erro interno"); }
 });
 
+// ... (Demais rotas inalteradas)
 app.get("/chats", async (req, res) => { 
     const limit = Number(req.query.limit) || 20
     const offset = Number(req.query.offset) || 0
