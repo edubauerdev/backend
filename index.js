@@ -18,7 +18,7 @@ const fs = require('fs')
 const app = express()
 app.use(cors())
 
-// Aumentando limite de payload
+// Aumentando limite de payload para garantir recebimento de mídias grandes
 app.use(express.json({ limit: '50mb' }))
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
@@ -48,6 +48,11 @@ const connectionStatus = {
 }
 
 let contactStore = {}
+
+// GARANTE QUE A PASTA DE SESSÃO EXISTE
+if (!fs.existsSync('./auth_info')) {
+    fs.mkdirSync('./auth_info', { recursive: true });
+}
 
 // --- FUNÇÃO DE STATUS DO BANCO ---
 async function updateStatusInDb(status, qrCode = null, phone = null) {
@@ -108,9 +113,7 @@ function prepareMessageForDB(msg, chatId) {
                     iv: messageContent.iv ? Buffer.from(messageContent.iv).toString('base64') : null,
                 }
             }
-        } catch (e) {
-            // Ignora erro de parsing de mídia para não travar o lote
-        }
+        } catch (e) {}
     }
 
     return {
@@ -136,14 +139,12 @@ function resolveChatName(chatId, chatName, pushName) {
 
 // --- WHATSAPP START ---
 async function startWhatsApp(isManualStart = false) {
-    if (sock?.user || isStarting) {
-        console.log("[WHATSAPP] Já está rodando ou iniciando.");
-        return;
-    }
+    if (sock?.user || isStarting) return;
 
     const hasAuthInfo = fs.existsSync("./auth_info/creds.json");
+    
     if (!isManualStart && !hasAuthInfo) {
-        console.log("[WHATSAPP] 🛑 Modo de Espera: Aguardando solicitação de QR Code...");
+        console.log("[WHATSAPP] 🛑 Modo de Espera.");
         await updateStatusInDb("disconnected", null, null);
         return;
     }
@@ -173,15 +174,13 @@ async function startWhatsApp(isManualStart = false) {
 
         sock.ev.on("creds.update", saveCreds)
 
-        // TIMER DE 5 MINUTOS (Só para login novo)
         if (isManualStart) {
             qrTimeout = setTimeout(async () => {
                 if (!sock?.user) {
-                    console.log("[TIMEOUT] ⏰ Tempo de QR esgotado. Desligando.");
+                    console.log("[TIMEOUT] ⏰ Tempo esgotado.");
                     try { sock.end(undefined); } catch (e) {}
                     sock = null;
                     isStarting = false;
-                    lastQrDataUrl = null;
                     await updateStatusInDb("disconnected", null, null);
                 }
             }, 5 * 60 * 1000);
@@ -193,46 +192,22 @@ async function startWhatsApp(isManualStart = false) {
 
         // --- SINCRONIZAÇÃO EM LOTES (PIPELINE) ---
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
-            console.log(`[SYNC] 🌊 Recebido: ${chats.length} chats, ${messages.length} msgs. Iniciando Pipeline...`)
+            console.log(`[SYNC] 🌊 Recebido: ${chats.length} chats, ${messages.length} msgs.`)
             if (qrTimeout) clearTimeout(qrTimeout);
 
-            // 1. Contatos (Leve)
             if (contacts) {
                 contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
             }
 
-            // 🔥 CORREÇÃO AQUI: Mapeia DATA e CONTEÚDO da última mensagem
-            const chatUpdateMap = {};
-            
-            messages.forEach(msg => {
-                const jid = msg.key.remoteJid;
-                const ts = Number(msg.messageTimestamp);
-                const body = getMessageText(msg); // Extrai o texto aqui!
-
-                // Se for mais recente, atualiza o mapa
-                if (!chatUpdateMap[jid] || ts > chatUpdateMap[jid].ts) {
-                    chatUpdateMap[jid] = {
-                        ts: ts,
-                        body: body
-                    };
-                }
-            });
-
-            // --- 2. PIPELINE DE CHATS ---
+            // 1. CHATS (Lotes de 25)
             const privateChats = chats.filter(c => !c.id.includes("@g.us"));
             const CHAT_BATCH_SIZE = 25;
             
-            console.log(`[SYNC] Processando ${privateChats.length} chats...`);
+            console.log(`[SYNC] Salvando ${privateChats.length} chats...`);
 
             for (let i = 0; i < privateChats.length; i += CHAT_BATCH_SIZE) {
                 let batch = privateChats.slice(i, i + CHAT_BATCH_SIZE).map(c => {
-                    // Pega os dados do mapa que criamos acima
-                    const updateData = chatUpdateMap[c.id];
-                    
-                    let timestamp = updateData ? updateData.ts : (c.conversationTimestamp ? Number(c.conversationTimestamp) : 0);
-                    let lastMsg = updateData ? updateData.body : ""; // Pega o texto do mapa!
-
-                    // Correções de data
+                    let timestamp = c.conversationTimestamp ? Number(c.conversationTimestamp) : 0;
                     if (timestamp > 0 && timestamp < 946684800000) timestamp = timestamp * 1000;
                     if (timestamp === 0) timestamp = 1000; 
 
@@ -243,11 +218,10 @@ async function startWhatsApp(isManualStart = false) {
                         is_group: false,
                         is_archived: c.archived || false,
                         last_message_time: timestamp, 
-                        last_message: lastMsg, // ✅ Agora populado corretamente
+                        // last_message será preenchido automaticamente pelo Trigger do banco
                     };
                 });
 
-                // Envia para o banco
                 const { error } = await supabase.from("chats").upsert(batch, { onConflict: 'id' });
                 if (error) console.error(`[SYNC] Erro Chats Lote ${i}:`, error.message);
                 
@@ -255,11 +229,11 @@ async function startWhatsApp(isManualStart = false) {
                 await new Promise(r => setTimeout(r, 100)); 
             }
 
-            // --- 3. PIPELINE DE MENSAGENS ---
+            // 2. MENSAGENS (Lotes de 50)
             const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
             const MSG_BATCH_SIZE = 50;
 
-            console.log(`[SYNC] Processando ${privateMessages.length} mensagens...`);
+            console.log(`[SYNC] Salvando ${privateMessages.length} mensagens...`);
 
             for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
                 let batch = privateMessages.slice(i, i + MSG_BATCH_SIZE).map(m => prepareMessageForDB(m, m.key.remoteJid));
@@ -280,7 +254,7 @@ async function startWhatsApp(isManualStart = false) {
             if (global.gc) global.gc()
         })
 
-        // Eventos Tempo Real
+        // --- MENSAGENS EM TEMPO REAL ---
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
             if (type !== "notify" && type !== "append") return
             for (const msg of messages) {
@@ -288,16 +262,8 @@ async function startWhatsApp(isManualStart = false) {
                 if (!chatId || chatId.includes("@g.us") || chatId === "status@broadcast") continue
 
                 const msgDB = prepareMessageForDB(msg, chatId)
+                // Apenas salva a mensagem. O Trigger do banco atualiza o chat.
                 await supabase.from("messages").upsert(msgDB)
-
-                const updateData = {
-                    last_message: getMessageText(msg),
-                    last_message_time: Number(msg.messageTimestamp) * 1000
-                }
-                if (!contactStore[chatId] && msg.pushName) {
-                    updateData.name = msg.pushName
-                }
-                await supabase.from("chats").update(updateData).eq("id", chatId)
             }
         })
 
@@ -307,7 +273,7 @@ async function startWhatsApp(isManualStart = false) {
             if (qr) {
                 lastQrDataUrl = await qrcode.toDataURL(qr)
                 connectionStatus.status = "qr"
-                console.log("[STATUS] 📱 QR Code gerado")
+                console.log("[STATUS] 📱 QR Code")
                 await updateStatusInDb("qr", lastQrDataUrl, null)
             }
             
@@ -349,7 +315,6 @@ async function startWhatsApp(isManualStart = false) {
     }
 }
 
-// Inicia em modo de espera
 startWhatsApp(false);
 
 const handleShutdown = async (signal) => {
@@ -396,14 +361,9 @@ app.get("/qr", (req, res) => {
 app.get("/chats/avatar/:chatId", async (req, res) => {
     const { chatId } = req.params;
     try {
-        // Validação leve para não bloquear cache se a conexão caiu por 1s
-        // if (!sock || !connectionStatus.connected) return res.status(404).send("Offline");
-        
-        // Pede a URL
         const url = await sock.profilePictureUrl(chatId, "image").catch(() => null);
         if (!url) return res.status(404).send("Sem foto");
         
-        // Baixa a Imagem
         const response = await fetch(url);
         if (!response.ok) return res.status(404).send("Erro baixar");
         
@@ -411,14 +371,13 @@ app.get("/chats/avatar/:chatId", async (req, res) => {
         const buffer = Buffer.from(arrayBuffer);
         
         res.set("Content-Type", "image/jpeg");
-        res.set("Cache-Control", "public, max-age=3600"); // Cache de 1h
+        res.set("Cache-Control", "public, max-age=3600"); 
         res.send(buffer);
     } catch (error) { 
         res.status(500).send("Erro interno"); 
     }
 });
 
-// ... Rotas de chats, messages, media ...
 app.get("/chats", async (req, res) => { 
     const limit = Number(req.query.limit) || 20
     const offset = Number(req.query.offset) || 0
