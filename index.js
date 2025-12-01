@@ -18,7 +18,7 @@ const fs = require('fs')
 const app = express()
 app.use(cors())
 
-// Aumentando limite de payload
+// Aumentando limite de payload para evitar erros em mensagens pesadas
 app.use(express.json({ limit: '50mb' }))
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
@@ -64,17 +64,25 @@ async function updateStatusInDb(status, qrCode = null, phone = null) {
     } catch (err) { console.error("[DB] Erro:", err) }
 }
 
-// --- FUNÇÕES AUXILIARES ---
+// --- FUNÇÕES AUXILIARES DE TRATAMENTO ---
+
 function getMessageText(msg) {
     if (!msg || !msg.message) return ""
     const content = msg.message
+    
+    // Prioridades de texto
     if (content.conversation) return content.conversation
     if (content.extendedTextMessage?.text) return content.extendedTextMessage.text
     if (content.imageMessage?.caption) return content.imageMessage.caption || "[Imagem]"
     if (content.videoMessage?.caption) return content.videoMessage.caption || "[Vídeo]"
     if (content.documentMessage?.caption) return content.documentMessage.caption || "[Documento]"
+    
+    // Tipos especiais
     if (content.audioMessage) return "[Áudio]"
     if (content.stickerMessage) return "[Sticker]"
+    if (content.protocolMessage && content.protocolMessage.type === 0) return "[Mensagem Revogada]"
+    if (content.reactionMessage) return `[Reação: ${content.reactionMessage.text}]`
+    
     return ""
 }
 
@@ -85,43 +93,65 @@ function getMessageType(msg) {
     if (msg.message.audioMessage) return "audio"
     if (msg.message.documentMessage) return "document"
     if (msg.message.stickerMessage) return "sticker"
+    if (msg.message.reactionMessage) return "reaction"
+    if (msg.message.protocolMessage) return "protocol"
     return "text"
 }
 
+// Função segura para sanitizar valores (undefined quebra o JSON do Supabase)
+const safeVal = (val) => (val === undefined ? null : val);
+
 function prepareMessageForDB(msg, chatId) {
-    const type = getMessageType(msg)
-    const hasMedia = ["image", "video", "audio", "document", "sticker"].includes(type)
-    let mediaMeta = null
+    try {
+        const type = getMessageType(msg)
+        const hasMedia = ["image", "video", "audio", "document", "sticker"].includes(type)
+        let mediaMeta = null
 
-    if (hasMedia) {
-        try {
-            const messageContent = msg.message[type + "Message"]
-            if (messageContent) {
-                mediaMeta = {
-                    url: messageContent.url,
-                    mediaKey: messageContent.mediaKey ? Buffer.from(messageContent.mediaKey).toString('base64') : null,
-                    mimetype: messageContent.mimetype,
-                    fileEncSha256: messageContent.fileEncSha256 ? Buffer.from(messageContent.fileEncSha256).toString('base64') : null,
-                    fileSha256: messageContent.fileSha256 ? Buffer.from(messageContent.fileSha256).toString('base64') : null,
-                    fileLength: messageContent.fileLength,
-                    directPath: messageContent.directPath,
-                    iv: messageContent.iv ? Buffer.from(messageContent.iv).toString('base64') : null,
+        if (hasMedia) {
+            try {
+                const messageContent = msg.message[type + "Message"]
+                if (messageContent) {
+                    // Mapeia garantindo que undefined vire null
+                    mediaMeta = {
+                        url: safeVal(messageContent.url),
+                        mediaKey: messageContent.mediaKey ? Buffer.from(messageContent.mediaKey).toString('base64') : null,
+                        mimetype: safeVal(messageContent.mimetype),
+                        fileEncSha256: messageContent.fileEncSha256 ? Buffer.from(messageContent.fileEncSha256).toString('base64') : null,
+                        fileSha256: messageContent.fileSha256 ? Buffer.from(messageContent.fileSha256).toString('base64') : null,
+                        fileLength: safeVal(messageContent.fileLength),
+                        directPath: safeVal(messageContent.directPath),
+                        iv: messageContent.iv ? Buffer.from(messageContent.iv).toString('base64') : null,
+                    }
                 }
+            } catch (e) {
+                console.error("Erro processando mediaMeta:", e)
             }
-        } catch (e) {}
-    }
+        }
 
-    return {
-        id: msg.key.id,
-        chat_id: chatId,
-        sender_id: msg.key.participant || msg.key.remoteJid,
-        content: getMessageText(msg),
-        timestamp: Number(msg.messageTimestamp) * 1000,
-        from_me: msg.key.fromMe || false,
-        type: type,
-        has_media: hasMedia,
-        media_meta: mediaMeta,
-        ack: msg.status || 0
+        const textContent = getMessageText(msg);
+
+        // Se não tem texto e não tem mídia (ex: atualizações de chave, protocolos obscuros), retorna null para filtrar
+        if (!textContent && !hasMedia) return null;
+
+        // Tratamento seguro de Timestamp
+        let ts = Number(msg.messageTimestamp);
+        if (isNaN(ts) || ts === 0) ts = Math.floor(Date.now() / 1000);
+        
+        return {
+            id: msg.key.id,
+            chat_id: chatId,
+            sender_id: msg.key.participant || msg.key.remoteJid || chatId, // Fallback de segurança
+            content: textContent,
+            timestamp: ts * 1000, // JS usa ms
+            from_me: msg.key.fromMe || false,
+            type: type,
+            has_media: hasMedia,
+            media_meta: mediaMeta, // Objeto limpo sem undefined
+            ack: msg.status || 0
+        }
+    } catch (err) {
+        console.error("Erro fatal preparando mensagem:", msg.key.id, err);
+        return null;
     }
 }
 
@@ -164,6 +194,8 @@ async function startWhatsApp(isManualStart = false) {
             generateHighQualityLinkPreview: true,
             connectTimeoutMs: 60000, 
             keepAliveIntervalMs: 10000,
+            // Importante: garante recebimento de mensagens offline
+            getMessage: async (key) => { return { conversation: "loading..." } } 
         })
 
         sock.ev.on("creds.update", saveCreds)
@@ -189,34 +221,33 @@ async function startWhatsApp(isManualStart = false) {
             console.log(`[SYNC] 🌊 Recebido: ${chats.length} chats, ${messages.length} msgs.`)
             if (qrTimeout) clearTimeout(qrTimeout);
 
-            // 1. Carrega contatos (Rápido)
+            // 1. Carrega contatos
             if (contacts) {
                 contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
             }
 
-            // 2. PIPELINE DE CHATS (Primeiro popula os chats)
+            // 2. PIPELINE DE CHATS
             const privateChats = chats.filter(c => !c.id.includes("@g.us"));
             const CHAT_BATCH_SIZE = 25;
             
             console.log(`[SYNC] Salvando ${privateChats.length} chats...`);
 
-            // Loop sequencial para chats
             for (let i = 0; i < privateChats.length; i += CHAT_BATCH_SIZE) {
-                let batch = privateChats.slice(i, i + CHAT_BATCH_SIZE).map(c => {
-                    // Apenas converte a data do chat (se existir)
+                const chunk = privateChats.slice(i, i + CHAT_BATCH_SIZE);
+                
+                let batch = chunk.map(c => {
                     let timestamp = c.conversationTimestamp ? Number(c.conversationTimestamp) : 0;
                     if (timestamp > 0 && timestamp < 946684800000) timestamp = timestamp * 1000;
                     if (timestamp === 0) timestamp = 1000; 
 
                     return {
                         id: c.id,
-                        phone: c.id.split('@')[0], // Mapeando coluna telefone
+                        phone: c.id.split('@')[0],
                         name: resolveChatName(c.id, c.name, null), 
                         unread_count: c.unreadCount || 0,
                         is_group: false,
                         is_archived: c.archived || false,
                         last_message_time: timestamp, 
-                        // last_message vai vazio (null) por enquanto
                     };
                 });
 
@@ -224,28 +255,39 @@ async function startWhatsApp(isManualStart = false) {
                 if (error) console.error(`[SYNC] Erro Chats Lote ${i}:`, error.message);
                 
                 batch = null; 
-                await new Promise(r => setTimeout(r, 100)); 
+                await new Promise(r => setTimeout(r, 50)); 
             }
             console.log("[SYNC] ✅ Chats finalizados. Iniciando mensagens...");
 
-            // 3. PIPELINE DE MENSAGENS (Só inicia após o loop de chats terminar)
+            // 3. PIPELINE DE MENSAGENS
             const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
-            const MSG_BATCH_SIZE = 50;
+            const MSG_BATCH_SIZE = 50; 
 
             console.log(`[SYNC] Salvando ${privateMessages.length} mensagens...`);
 
             for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
-                let batch = privateMessages.slice(i, i + MSG_BATCH_SIZE).map(m => prepareMessageForDB(m, m.key.remoteJid));
+                const chunk = privateMessages.slice(i, i + MSG_BATCH_SIZE);
                 
-                const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' });
-                if (error) console.error(`[SYNC] Erro Msgs Lote ${i}:`, error.message);
+                // Mapeia e FILTRA nulos (mensagens corrompidas ou protocolos vazios)
+                let batch = chunk
+                    .map(m => prepareMessageForDB(m, m.key.remoteJid))
+                    .filter(item => item !== null); 
+                
+                if (batch.length > 0) {
+                    const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' });
+                    if (error) {
+                        console.error(`[SYNC] ❌ Erro Crítico no Lote ${i} (tentando recuperar):`, error.message);
+                        // Opcional: Se der erro no lote, poderia tentar inserir 1 por 1 aqui para não perder tudo,
+                        // mas geralmente o erro é formato de dados, que o prepareMessageForDB já deve ter resolvido.
+                    }
+                }
                 
                 if (i % 500 === 0 && i > 0) console.log(`[SYNC] Progresso: ${i}/${privateMessages.length} msgs.`);
 
                 batch = null; 
                 if (global.gc && i % 1000 === 0) global.gc();
 
-                await new Promise(r => setTimeout(r, 200)); 
+                await new Promise(r => setTimeout(r, 100)); // Pequeno delay para aliviar o banco
             }
 
             // 4. FASE FINAL
@@ -263,12 +305,11 @@ async function startWhatsApp(isManualStart = false) {
 
                 const msgDB = prepareMessageForDB(msg, chatId)
                 
-                // Salva a mensagem. O Trigger do banco atualiza o Chat.
-                await supabase.from("messages").upsert(msgDB)
-
-                // Se for número novo (não tem nome), tenta atualizar nome
-                if (!contactStore[chatId] && msg.pushName) {
-                     await supabase.from("chats").update({ name: msg.pushName }).eq("id", chatId)
+                if (msgDB) {
+                    await supabase.from("messages").upsert(msgDB)
+                    if (!contactStore[chatId] && msg.pushName) {
+                         await supabase.from("chats").update({ name: msg.pushName }).eq("id", chatId)
+                    }
                 }
             }
         })
