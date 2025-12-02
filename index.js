@@ -183,63 +183,101 @@ async function startWhatsApp(isManualStart = false) {
             })
         })
 
-        // --- SINCRONIZAÇÃO OTIMIZADA (MERGE PER BATCH) ---
+        // ========================================
+        // SINCRONIZAÇÃO OTIMIZADA EM 3 ETAPAS
+        // ========================================
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
-            console.log(`[SYNC] 🌊 Dados Brutos: ${chats.length} chats, ${contacts.length} contatos.`);
+            console.log(`[SYNC] 🌊 Iniciando sincronização...`);
+            console.log(`[SYNC] 📊 Dados recebidos: ${chats.length} chats, ${contacts.length} contatos, ${messages.length} mensagens`);
+            
             if (qrTimeout) clearTimeout(qrTimeout);
 
-            // 1. DEBUG: Vamos ver como o contato está chegando
-            if (contacts.length > 0) {
-                console.log("[DEBUG] Exemplo de Contato:", JSON.stringify(contacts[0], null, 2));
+            // ========================================
+            // ETAPA 1: CONSTRUIR MAPA DE NOMES
+            // ========================================
+            console.log("[SYNC] 📇 Etapa 1/3: Construindo mapa de nomes...");
+            
+            const nameMap = new Map(); // Usando Map ao invés de objeto para melhor performance
+            
+            // 1.1 Processar APENAS os contatos (rápido - geralmente poucos contatos)
+            contacts.forEach(contact => {
+                if (!contact.id) return;
+                
+                const normalizedId = jidNormalizedUser(contact.id);
+                
+                // Prioridade: name > notify > verifiedName > short
+                const name = contact.name || contact.notify || contact.verifiedName || contact.short;
+                
+                if (name && name.trim()) {
+                    nameMap.set(normalizedId, name.trim());
+                }
+            });
+            
+            console.log(`[SYNC] ✅ Mapa construído com ${nameMap.size} nomes de contatos`);
+            
+            // DEBUG: Mostrar alguns exemplos
+            if (nameMap.size > 0) {
+                const samples = Array.from(nameMap.entries()).slice(0, 3);
+                console.log("[DEBUG] Exemplos de mapeamento:");
+                samples.forEach(([id, name]) => {
+                    console.log(`  ${id} → "${name}"`);
+                });
             }
 
-            // 2. PREPARAÇÃO DO MAPA (RAM - Rápido e Obrigatório)
-            // Precisamos iterar todos os contatos 1 vez para saber quem é quem
-            const nameMap = {};
+            // ========================================
+            // ETAPA 2: PROCESSAR E SALVAR CHATS
+            // ========================================
+            console.log("[SYNC] 💬 Etapa 2/3: Processando chats...");
             
-            contacts.forEach(c => {
-                // Tentamos todas as propriedades possíveis onde o nome se esconde
-                const name = c.name || c.notify || c.verifiedName || c.short;
-                if (name && c.id) {
-                    nameMap[jidNormalizedUser(c.id)] = name;
-                }
-            });
-
-            // Extrai PushNames de mensagens para preencher buracos
-            messages.forEach(m => {
-                if (m.pushName && m.key.remoteJid) {
-                    const id = jidNormalizedUser(m.key.remoteJid);
-                    if (!nameMap[id]) nameMap[id] = m.pushName;
-                }
-            });
+            const privateChats = chats.filter(c => 
+                !c.id.includes("@g.us") && 
+                !c.id.includes("broadcast")
+            );
             
-            // Atualiza o store global
-            Object.assign(contactStore, nameMap);
-            console.log(`[SYNC] 📇 Mapa de Nomes construído: ${Object.keys(nameMap).length} entradas.`);
-
-            // 3. PROCESSAMENTO E ENVIO EM LOTES (MERGE REAL-TIME)
-            const privateChats = chats.filter(c => !c.id.includes("@g.us") && !c.id.includes("broadcast"));
+            console.log(`[SYNC] 📱 Total de chats privados: ${privateChats.length}`);
+            
             const CHAT_BATCH_SIZE = 100;
-
-            console.log(`[SYNC] Iniciando processamento de ${privateChats.length} chats em lotes...`);
+            let chatsProcessed = 0;
+            let chatsWithName = 0;
+            let chatsWithoutName = 0;
 
             for (let i = 0; i < privateChats.length; i += CHAT_BATCH_SIZE) {
-                // 3.1 Pega o lote "cru" (apenas ID e metadados básicos)
                 const rawBatch = privateChats.slice(i, i + CHAT_BATCH_SIZE);
                 
-                // 3.2 MESCLA: Cria o objeto final APENAS para este lote
                 const processedBatch = rawBatch.map(chat => {
-                    const id = jidNormalizedUser(chat.id);
-                    // Procura no Mapa Global
-                    const finalName = nameMap[id] || contactStore[id] || chat.name || id.split('@')[0];
+                    const normalizedId = jidNormalizedUser(chat.id);
+                    const phone = normalizedId.split('@')[0];
+                    
+                    // ORDEM DE PRIORIDADE PARA RESOLVER O NOME:
+                    // 1. nameMap (contatos do Baileys)
+                    // 2. contactStore (cache global)
+                    // 3. chat.name (nome do próprio objeto chat)
+                    // 4. phone (fallback - número de telefone)
+                    let finalName = nameMap.get(normalizedId) || 
+                                   contactStore[normalizedId] || 
+                                   chat.name || 
+                                   phone;
+                    
+                    // Atualizar cache global
+                    if (nameMap.has(normalizedId)) {
+                        contactStore[normalizedId] = nameMap.get(normalizedId);
+                    }
+                    
+                    // Contador para debug
+                    if (finalName !== phone) {
+                        chatsWithName++;
+                    } else {
+                        chatsWithoutName++;
+                    }
 
+                    // Timestamp
                     let timestamp = chat.conversationTimestamp ? Number(chat.conversationTimestamp) : Date.now() / 1000;
                     if (timestamp < 946684800000) timestamp *= 1000;
 
                     return {
-                        id: id,
-                        name: finalName, // Nome resolvido aqui
-                        phone: id.split('@')[0],
+                        id: normalizedId,
+                        name: finalName,
+                        phone: phone,
                         unread_count: chat.unreadCount || 0,
                         is_archived: chat.archived || false,
                         last_message_time: timestamp,
@@ -247,35 +285,120 @@ async function startWhatsApp(isManualStart = false) {
                     };
                 });
 
-                // 3.3 Envia o lote mesclado
-                const { error } = await supabase.from("chats").upsert(processedBatch, { onConflict: 'id' });
+                // Salvar lote no banco
+                const { error } = await supabase
+                    .from("chats")
+                    .upsert(processedBatch, { onConflict: 'id' });
                 
                 if (error) {
-                    console.error(`[SYNC] ❌ Erro lote ${i}:`, error.message);
+                    console.error(`[SYNC] ❌ Erro ao salvar lote ${i}-${i + CHAT_BATCH_SIZE}:`, error.message);
+                } else {
+                    chatsProcessed += processedBatch.length;
                 }
-
-                // 3.4 Libera memória imediatamente
-                // O Garbage Collector do JS vai pegar isso assim que possível
+                
+                // Log de progresso a cada 200 chats
+                if (chatsProcessed % 200 === 0 && chatsProcessed > 0) {
+                    console.log(`[SYNC] 📊 Progresso: ${chatsProcessed}/${privateChats.length} chats processados`);
+                }
             }
-            console.log("[SYNC] ✅ Chats processados e enviados.");
+            
+            console.log(`[SYNC] ✅ Chats salvos: ${chatsProcessed}`);
+            console.log(`[SYNC] 📊 Com nome: ${chatsWithName} | Sem nome: ${chatsWithoutName}`);
 
-            // 4. MENSAGENS (Lotes)
-            const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
-            const MSG_BATCH_SIZE = 50; 
+            // ========================================
+            // ETAPA 3: PROCESSAR E SALVAR MENSAGENS
+            // ========================================
+            console.log("[SYNC] 📨 Etapa 3/3: Processando mensagens...");
+            
+            const privateMessages = messages.filter(m => 
+                m.key.remoteJid && 
+                !m.key.remoteJid.includes("@g.us")
+            );
+            
+            console.log(`[SYNC] 📧 Total de mensagens privadas: ${privateMessages.length}`);
+            
+            const MSG_BATCH_SIZE = 50;
+            let messagesProcessed = 0;
+            let messagesWithPushName = 0;
 
             for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
                 const chunk = privateMessages.slice(i, i + MSG_BATCH_SIZE);
-                const batch = chunk.map(m => prepareMessageForDB(m, m.key.remoteJid)).filter(i => i !== null);
+                
+                // Capturar pushNames durante o processamento
+                chunk.forEach(msg => {
+                    if (msg.pushName && msg.key.remoteJid) {
+                        const normalizedId = jidNormalizedUser(msg.key.remoteJid);
+                        const currentName = contactStore[normalizedId];
+                        const phone = normalizedId.split('@')[0];
+                        
+                        // Só atualiza se:
+                        // 1. Não existe nome no cache OU
+                        // 2. O nome atual é igual ao telefone (placeholder)
+                        if (!currentName || currentName === phone) {
+                            contactStore[normalizedId] = msg.pushName;
+                            messagesWithPushName++;
+                            
+                            // Atualizar nome no chat também (sem await para não travar)
+                            supabase
+                                .from("chats")
+                                .update({ name: msg.pushName })
+                                .eq('id', normalizedId)
+                                .then(({ error }) => {
+                                    if (!error) {
+                                        console.log(`[SYNC] 🔄 Nome atualizado via pushName: ${normalizedId} → "${msg.pushName}"`);
+                                    }
+                                });
+                        }
+                    }
+                });
+                
+                const batch = chunk
+                    .map(m => prepareMessageForDB(m, m.key.remoteJid))
+                    .filter(i => i !== null);
                 
                 if (batch.length > 0) {
-                    await supabase.from("messages").upsert(batch, { onConflict: 'id' });
+                    const { error } = await supabase
+                        .from("messages")
+                        .upsert(batch, { onConflict: 'id' });
+                    
+                    if (error) {
+                        console.error(`[SYNC] ❌ Erro ao salvar mensagens:`, error.message);
+                    } else {
+                        messagesProcessed += batch.length;
+                    }
                 }
-                if (i % 200 === 0) await new Promise(r => setTimeout(r, 20)); 
+                
+                // Delay pequeno a cada 200 mensagens
+                if (i % 200 === 0 && i > 0) {
+                    await new Promise(r => setTimeout(r, 20));
+                }
+                
+                // Log de progresso
+                if (messagesProcessed % 500 === 0 && messagesProcessed > 0) {
+                    console.log(`[SYNC] 📊 Progresso: ${messagesProcessed}/${privateMessages.length} mensagens processadas`);
+                }
+            }
+            
+            console.log(`[SYNC] ✅ Mensagens salvas: ${messagesProcessed}`);
+            if (messagesWithPushName > 0) {
+                console.log(`[SYNC] 🔄 Nomes atualizados via pushName: ${messagesWithPushName}`);
             }
 
-            await updateStatusInDb("connected", null, sock?.user?.id)
-            console.log("[SYNC] ✅ Sincronização COMPLETA.")
-            if (global.gc) global.gc()
+            // ========================================
+            // FINALIZAÇÃO
+            // ========================================
+            await updateStatusInDb("connected", null, sock?.user?.id);
+            console.log("[SYNC] ✅ SINCRONIZAÇÃO COMPLETA!");
+            console.log("[SYNC] 📊 Resumo:");
+            console.log(`  - Chats: ${chatsProcessed} (${chatsWithName} com nome)`);
+            console.log(`  - Mensagens: ${messagesProcessed}`);
+            console.log(`  - Cache de nomes: ${Object.keys(contactStore).length} entradas`);
+            
+            // Força garbage collection se disponível
+            if (global.gc) {
+                global.gc();
+                console.log("[SYNC] 🗑️ Garbage collection executado");
+            }
         })
 
         // Eventos Tempo Real
@@ -284,6 +407,21 @@ async function startWhatsApp(isManualStart = false) {
             for (const msg of messages) {
                 const chatId = msg.key.remoteJid
                 if (!chatId || chatId.includes("@g.us") || chatId === "status@broadcast") continue
+
+                // Atualizar nome se vier pushName
+                if (msg.pushName) {
+                    const normalizedId = jidNormalizedUser(chatId);
+                    const currentName = contactStore[normalizedId];
+                    const phone = normalizedId.split('@')[0];
+                    
+                    if (!currentName || currentName === phone) {
+                        contactStore[normalizedId] = msg.pushName;
+                        await supabase
+                            .from("chats")
+                            .update({ name: msg.pushName })
+                            .eq('id', normalizedId);
+                    }
+                }
 
                 const msgDB = prepareMessageForDB(msg, chatId)
                 if (msgDB) {
