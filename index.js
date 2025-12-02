@@ -118,10 +118,14 @@ function prepareMessageForDB(msg, chatId) {
         let ts = Number(msg.messageTimestamp);
         if (isNaN(ts) || ts === 0) ts = Math.floor(Date.now() / 1000);
         
+        // Normalize all IDs to prevent duplicates from @lid vs @s.whatsapp.net
+        const normalizedChatId = jidNormalizedUser(chatId);
+        const normalizedSenderId = jidNormalizedUser(msg.key.participant || msg.key.remoteJid || chatId);
+        
         return {
             id: msg.key.id,
-            chat_id: chatId,
-            sender_id: msg.key.participant || msg.key.remoteJid || chatId,
+            chat_id: normalizedChatId,
+            sender_id: normalizedSenderId,
             content: textContent,
             timestamp: ts * 1000,
             from_me: msg.key.fromMe || false,
@@ -228,12 +232,19 @@ async function startWhatsApp(isManualStart = false) {
                 // ETAPA 1: POPULAR CHATS (OBRIGATÓRIO PRIMEIRO)
                 // ========================================
                 console.log("[SYNC] 📁 ETAPA 1/2: Populando CHATS...");
-                
+
+                // Filtra e remove duplicados pelo id normalizado
+                const seenChatIds = new Set();
                 const privateChats = chats.filter(c => 
                     c.id && 
                     !c.id.includes("@g.us") && 
                     !c.id.includes("broadcast")
-                );
+                ).filter(c => {
+                    const normalizedId = jidNormalizedUser(c.id);
+                    if (seenChatIds.has(normalizedId)) return false;
+                    seenChatIds.add(normalizedId);
+                    return true;
+                });
 
                 const CHAT_BATCH_SIZE = 50;
                 const totalChats = privateChats.length;
@@ -241,16 +252,16 @@ async function startWhatsApp(isManualStart = false) {
 
                 for (let i = 0; i < totalChats; i += CHAT_BATCH_SIZE) {
                     const batch = privateChats.slice(i, i + CHAT_BATCH_SIZE);
-                    
+
                     const chatRecords = batch.map(chat => {
                         const normalizedId = jidNormalizedUser(chat.id);
                         const phone = normalizedId.split('@')[0];
                         const name = nameMap.get(normalizedId) || chat.name || phone;
-                        
+
                         let timestamp = chat.conversationTimestamp 
                             ? Number(chat.conversationTimestamp) 
                             : Date.now() / 1000;
-                        
+
                         if (timestamp < 946684800000) timestamp *= 1000;
 
                         return {
@@ -320,7 +331,7 @@ async function startWhatsApp(isManualStart = false) {
                     const batch = privateMessages.slice(i, i + MSG_BATCH_SIZE);
                     
                     const messageRecords = batch
-                        .map(msg => prepareMessageForDB(msg, msg.key.remoteJid))
+                        .map(msg => prepareMessageForDB(msg, jidNormalizedUser(msg.key.remoteJid)))
                         .filter(m => m !== null);
 
                     if (messageRecords.length > 0) {
@@ -384,14 +395,15 @@ async function startWhatsApp(isManualStart = false) {
                 const chatId = msg.key.remoteJid
                 if (!chatId || chatId.includes("@g.us") || chatId === "status@broadcast") continue
 
+                const normalizedChatId = jidNormalizedUser(chatId);
+                
                 // Se descobrir um nome novo, atualiza o chat existente
                 if(!msg.key.fromMe && msg.pushName) {
-                    const id = jidNormalizedUser(chatId);
                     // Atualiza apenas o nome sem mexer no resto
-                    await supabase.from('chats').upsert({ id: id, name: msg.pushName }, { onConflict: 'id' }).catch(() => {});
+                    await supabase.from('chats').upsert({ id: normalizedChatId, name: msg.pushName }, { onConflict: 'id' }).catch(() => {});
                 }
 
-                const msgDB = prepareMessageForDB(msg, chatId)
+                const msgDB = prepareMessageForDB(msg, normalizedChatId)
                 if (msgDB) {
                     await supabase.from("messages").upsert(msgDB)
                 }
@@ -474,8 +486,9 @@ app.get("/qr", (req, res) => {
 })
 app.get("/chats/avatar/:chatId", async (req, res) => {
     const { chatId } = req.params;
+    const normalizedChatId = jidNormalizedUser(chatId);
     try {
-        const url = await sock.profilePictureUrl(chatId, "image").catch(() => null);
+        const url = await sock.profilePictureUrl(normalizedChatId, "image").catch(() => null);
         if (!url) return res.status(404).send("Sem foto");
         const response = await fetch(url);
         if (!response.ok) return res.status(404).send("Erro baixar");
@@ -501,11 +514,12 @@ app.get("/chats", async (req, res) => {
 // Lazy Loading Messages
 app.get("/chats/:chatId/messages", async (req, res) => { 
     const { chatId } = req.params
+    const normalizedChatId = jidNormalizedUser(chatId);
     const limit = Number(req.query.limit) || 20
     const offset = Number(req.query.offset) || 0
-    if (chatId.includes("@g.us")) return res.status(403).json({ success: false })
+    if (normalizedChatId.includes("@g.us")) return res.status(403).json({ success: false })
     try {
-        const { data: messages, error, count } = await supabase.from('messages').select('*', { count: 'exact' }).eq('chat_id', chatId).order('timestamp', { ascending: false }).range(offset, offset + limit - 1)
+        const { data: messages, error, count } = await supabase.from('messages').select('*', { count: 'exact' }).eq('chat_id', normalizedChatId).order('timestamp', { ascending: false }).range(offset, offset + limit - 1)
         if (error) throw error
         const formattedMsgs = messages.sort((a, b) => a.timestamp - b.timestamp).map(m => ({ id: m.id, body: m.content, timestamp: m.timestamp, from: m.sender_id, to: m.chat_id, fromMe: m.from_me, type: m.type, hasMedia: m.has_media, mediaUrl: m.has_media ? `${process.env.API_URL || 'http://localhost:3000'}/media/${m.chat_id}/${m.id}` : null, mimeType: m.media_meta?.mimetype, ack: m.ack }))
         res.json({ success: true, messages: formattedMsgs, hasMore: (offset + limit) < count, total: count })
@@ -513,7 +527,8 @@ app.get("/chats/:chatId/messages", async (req, res) => {
 })
 app.get("/media/:chatId/:messageId", async (req, res) => { 
     const { chatId, messageId } = req.params
-    if (chatId.includes("@g.us")) return res.status(403).send("Bloqueado")
+    const normalizedChatId = jidNormalizedUser(chatId);
+    if (normalizedChatId.includes("@g.us")) return res.status(403).send("Bloqueado")
     try {
         const { data: msg } = await supabase.from('messages').select('media_meta, type').eq('id', messageId).single()
         if (!msg?.media_meta) return res.status(404).send("Mídia não encontrada")
@@ -526,9 +541,10 @@ app.get("/media/:chatId/:messageId", async (req, res) => {
 })
 app.post("/chats/send", async (req, res) => {
     const { chatId, message } = req.body
+    const normalizedChatId = jidNormalizedUser(chatId);
     if (!connectionStatus.connected || !sock) return res.status(400).json({ success: false })
     try {
-        const result = await sock.sendMessage(chatId, { text: message })
+        const result = await sock.sendMessage(normalizedChatId, { text: message })
         res.json({ success: true, messageId: result?.key?.id })
     } catch (error) { res.status(500).json({ success: false, error: error.message }) }
 })
