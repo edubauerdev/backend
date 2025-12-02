@@ -421,26 +421,6 @@ app.get("/chats/avatar/:chatId", async (req, res) => {
     } catch (error) { res.status(500).send("Erro interno"); }
 });
 
-// === NOVA ROTA: LISTAR CONTATOS DO BAILEYS (RAM) ===
-app.get("/nomes", (req, res) => {
-    try {
-        // Converte o objeto {id: nome} para um array [ {id, name}, ... ] para facilitar leitura
-        const contactsArray = Object.entries(contactStore).map(([id, name]) => ({
-            id,
-            name
-        }));
-
-        res.json({
-            success: true,
-            total: contactsArray.length,
-            contacts: contactsArray
-        });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-// ====================================================
-
 // ... Rotas de chats, messages, media ...
 app.get("/chats", async (req, res) => { 
     const limit = Number(req.query.limit) || 20
