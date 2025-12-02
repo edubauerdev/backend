@@ -116,10 +116,15 @@ function prepareMessageForDB(msg, chatId) {
         } catch (e) {}
     }
 
+    // Obtém o nome do contato (adicione estas linhas)
+    const senderId = msg.key.participant || msg.key.remoteJid
+    const contactName = contactStore[senderId] || msg.pushName || senderId.split('@')[0]
+
     return {
         id: msg.key.id,
         chat_id: chatId,
-        sender_id: msg.key.participant || msg.key.remoteJid,
+        sender_id: senderId,
+        contact_name: contactName, // NOVA LINHA
         content: getMessageText(msg),
         timestamp: Number(msg.messageTimestamp) * 1000,
         from_me: msg.key.fromMe || false,
@@ -195,9 +200,26 @@ async function startWhatsApp(isManualStart = false) {
             console.log(`[SYNC] 🌊 Recebido: ${chats.length} chats, ${messages.length} msgs.`)
             if (qrTimeout) clearTimeout(qrTimeout);
 
+            // ✅ Status: syncing (início da sincronização)
+            await updateStatusInDb("syncing", null, sock?.user?.id)
+
             if (contacts) {
                 contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
             }
+
+            // Popular contactStore também dos pushNames das mensagens
+            messages.forEach(m => {
+                if (m.pushName) {
+                    const senderId = m.key.participant || m.key.remoteJid
+                    if (!contactStore[senderId]) {
+                        contactStore[senderId] = m.pushName
+                    }
+                }
+            })
+
+            // ✅ FILTRO DE 6 MESES
+            const SIX_MONTHS_MS = 6 * 30 * 24 * 60 * 60 * 1000
+            const cutoffTimestamp = Date.now() - SIX_MONTHS_MS
 
             // 1. CHATS (Lotes de 25)
             const privateChats = chats.filter(c => !c.id.includes("@g.us"));
@@ -218,7 +240,6 @@ async function startWhatsApp(isManualStart = false) {
                         is_group: false,
                         is_archived: c.archived || false,
                         last_message_time: timestamp, 
-                        // last_message será preenchido automaticamente pelo Trigger do banco
                     };
                 });
 
@@ -229,11 +250,18 @@ async function startWhatsApp(isManualStart = false) {
                 await new Promise(r => setTimeout(r, 100)); 
             }
 
-            // 2. MENSAGENS (Lotes de 50)
-            const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
+            // 2. MENSAGENS (Lotes de 50) - COM FILTRO DE 6 MESES
+            const privateMessages = messages.filter(m => {
+                if (!m.key.remoteJid || m.key.remoteJid.includes("@g.us")) return false
+                
+                const msgTimestamp = Number(m.messageTimestamp) * 1000
+                return msgTimestamp >= cutoffTimestamp
+            });
+            
             const MSG_BATCH_SIZE = 50;
 
-            console.log(`[SYNC] Salvando ${privateMessages.length} mensagens...`);
+            const totalFiltered = messages.length - privateMessages.length
+            console.log(`[SYNC] Salvando ${privateMessages.length} mensagens (${totalFiltered} filtradas por idade/grupo)...`);
 
             for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
                 let batch = privateMessages.slice(i, i + MSG_BATCH_SIZE).map(m => prepareMessageForDB(m, m.key.remoteJid));
@@ -249,7 +277,9 @@ async function startWhatsApp(isManualStart = false) {
                 await new Promise(r => setTimeout(r, 200)); 
             }
             
+            // ✅ Status: connected (sincronização completa)
             await updateStatusInDb("connected", null, sock?.user?.id)
+            
             console.log("[SYNC] ✅ Sincronização COMPLETA.")
             if (global.gc) global.gc()
         })
@@ -273,7 +303,8 @@ async function startWhatsApp(isManualStart = false) {
             if (qr) {
                 lastQrDataUrl = await qrcode.toDataURL(qr)
                 connectionStatus.status = "qr"
-                console.log("[STATUS] 📱 QR Code")
+                console.log("[STATUS] 📱 QR Code gerado")
+                // ✅ Status: qr
                 await updateStatusInDb("qr", lastQrDataUrl, null)
             }
             
@@ -283,8 +314,10 @@ async function startWhatsApp(isManualStart = false) {
                 connectionStatus.phone = sock.user?.id
                 connectionStatus.status = "connected"
                 lastQrDataUrl = null
-                console.log("[WHATSAPP] ✅ Conectado")
-                await updateStatusInDb("connected", null, sock.user?.id)
+                console.log("[WHATSAPP] ✅ Conectado - Aguardando sincronização...")
+                // ⚠️ NÃO atualiza para "connected" aqui!
+                // O status "syncing" será setado pelo evento messaging-history.set
+                // E depois "connected" quando a sync terminar
             }
             
             if (connection === "close") {
@@ -294,6 +327,7 @@ async function startWhatsApp(isManualStart = false) {
                 lastQrDataUrl = null
                 
                 console.log("[STATUS] ❌ Desconectado. Razão:", reason)
+                // ✅ Status: disconnected
                 await updateStatusInDb("disconnected", null, null)
 
                 const hasSession = fs.existsSync("./auth_info/creds.json");
@@ -309,7 +343,6 @@ async function startWhatsApp(isManualStart = false) {
         })
 
     } catch (err) {
-        console.error("Erro start:", err)
         await updateStatusInDb("error", null, null)
         isStarting = false
     }
