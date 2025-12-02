@@ -48,9 +48,6 @@ const connectionStatus = {
     status: "disconnected",
 }
 
-// Armazena nomes temporariamente na memória para vincular aos chats
-let contactNameStore = {} 
-
 // --- ATUALIZA STATUS NO BANCO ---
 async function updateStatusInDb(status, qrCode = null, phone = null) {
     try {
@@ -118,9 +115,10 @@ function prepareMessageForDB(msg, chatId) {
         let ts = Number(msg.messageTimestamp);
         if (isNaN(ts) || ts === 0) ts = Math.floor(Date.now() / 1000);
         
-        // Normalize all IDs to prevent duplicates from @lid vs @s.whatsapp.net
+        // Normalize all IDs consistently
         const normalizedChatId = jidNormalizedUser(chatId);
-        const normalizedSenderId = jidNormalizedUser(msg.key.participant || msg.key.remoteJid || chatId);
+        const rawSenderId = msg.key.participant || msg.key.remoteJid || chatId;
+        const normalizedSenderId = jidNormalizedUser(rawSenderId);
         
         return {
             id: msg.key.id,
@@ -187,7 +185,6 @@ async function startWhatsApp(isManualStart = false) {
             }, 5 * 60 * 1000);
         }
 
-        // --- LÓGICA DE SINCRONIZAÇÃO (2 ETAPAS) ---
         // ========================================
         // SINCRONIZAÇÃO EM 2 ETAPAS COM LIMPEZA DE MEMÓRIA
         // ========================================
@@ -233,13 +230,11 @@ async function startWhatsApp(isManualStart = false) {
                 // ========================================
                 console.log("[SYNC] 📁 ETAPA 1/2: Populando CHATS...");
 
-                // Filtra e remove duplicados pelo id normalizado
+                // Filtra e normaliza ANTES de verificar duplicatas
                 const seenChatIds = new Set();
-                const privateChats = chats.filter(c => 
-                    c.id && 
-                    !c.id.includes("@g.us") && 
-                    !c.id.includes("broadcast")
-                ).filter(c => {
+                const privateChats = chats.filter(c => {
+                    if (!c.id || c.id.includes("@g.us") || c.id.includes("broadcast")) return false;
+                    
                     const normalizedId = jidNormalizedUser(c.id);
                     if (seenChatIds.has(normalizedId)) return false;
                     seenChatIds.add(normalizedId);
@@ -392,18 +387,18 @@ async function startWhatsApp(isManualStart = false) {
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
             if (type !== "notify" && type !== "append") return
             for (const msg of messages) {
-                const chatId = msg.key.remoteJid
+                let chatId = msg.key.remoteJid
                 if (!chatId || chatId.includes("@g.us") || chatId === "status@broadcast") continue
 
-                const normalizedChatId = jidNormalizedUser(chatId);
+                // Normaliza IMEDIATAMENTE
+                chatId = jidNormalizedUser(chatId);
                 
                 // Se descobrir um nome novo, atualiza o chat existente
                 if(!msg.key.fromMe && msg.pushName) {
-                    // Atualiza apenas o nome sem mexer no resto
-                    await supabase.from('chats').upsert({ id: normalizedChatId, name: msg.pushName }, { onConflict: 'id' }).catch(() => {});
+                    await supabase.from('chats').upsert({ id: chatId, name: msg.pushName }, { onConflict: 'id' }).catch(() => {});
                 }
 
-                const msgDB = prepareMessageForDB(msg, normalizedChatId)
+                const msgDB = prepareMessageForDB(msg, chatId)
                 if (msgDB) {
                     await supabase.from("messages").upsert(msgDB)
                 }
@@ -430,6 +425,7 @@ async function startWhatsApp(isManualStart = false) {
                 connectionStatus.connected = false
                 connectionStatus.status = "disconnected"
                 lastQrDataUrl = null
+                if (qrTimeout) clearTimeout(qrTimeout);
                 await updateStatusInDb("disconnected", null, null)
                 const hasSession = fs.existsSync("./auth_info/creds.json");
                 if (reason !== DisconnectReason.loggedOut && hasSession) {
