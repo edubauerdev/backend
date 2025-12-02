@@ -184,92 +184,197 @@ async function startWhatsApp(isManualStart = false) {
         }
 
         // --- LÓGICA DE SINCRONIZAÇÃO (2 ETAPAS) ---
+        // ========================================
+        // SINCRONIZAÇÃO EM 2 ETAPAS COM LIMPEZA DE MEMÓRIA
+        // ========================================
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
-            console.log(`[SYNC] 🌊 Recebido: ${chats.length} chats | ${messages.length} mensagens`);
+            console.log(`[SYNC] 🌊 Iniciando sincronização...`);
+            console.log(`[SYNC] 📊 Recebido: ${chats.length} chats | ${contacts.length} contatos | ${messages.length} mensagens`);
+            
             if (qrTimeout) clearTimeout(qrTimeout);
 
-            // 0. PREPARAÇÃO: Mapear nomes dos contatos para usar nos chats
-            if (contacts) contacts.forEach(c => { 
-                if (c.name || c.notify) contactNameStore[c.id] = c.name || c.notify 
-            });
-            // Tenta pegar nomes também das mensagens (PushNames)
-            messages.forEach(m => {
-                if (m.pushName && m.key.remoteJid) {
-                    contactNameStore[m.key.remoteJid] = m.pushName;
-                }
-            });
-
-            // ==================================================================================
-            // ETAPA 1: POPULAR CHATS (LOTE 100)
-            // ==================================================================================
-            // Filtra chats (remove grupos se necessário, aqui removendo @g.us conforme padrão anterior)
-            const privateChats = chats.filter(c => !c.id.includes("@g.us") && !c.id.includes("broadcast"));
-            const CHAT_BATCH_SIZE = 100;
-
-            console.log(`[SYNC - ETAPA 1] 📁 Processando ${privateChats.length} chats...`);
-
-            for (let i = 0; i < privateChats.length; i += CHAT_BATCH_SIZE) {
-                const batchRaw = privateChats.slice(i, i + CHAT_BATCH_SIZE);
+            try {
+                // ========================================
+                // PREPARAÇÃO: MAPA DE NOMES
+                // ========================================
+                const nameMap = new Map();
                 
-                const batchChats = batchRaw.map(c => {
-                    const id = jidNormalizedUser(c.id);
-                    // Tenta achar o nome no mapa, ou no objeto chat, ou usa o número
-                    const name = contactNameStore[id] || c.name || id.split('@')[0];
+                // Contatos
+                if (contacts && contacts.length > 0) {
+                    contacts.forEach(c => {
+                        if (c.id) {
+                            const normalizedId = jidNormalizedUser(c.id);
+                            const name = c.name || c.notify || c.verifiedName || c.short;
+                            if (name) nameMap.set(normalizedId, name);
+                        }
+                    });
+                }
+                
+                // PushNames das mensagens
+                if (messages && messages.length > 0) {
+                    messages.forEach(m => {
+                        if (m.pushName && m.key.remoteJid) {
+                            const normalizedId = jidNormalizedUser(m.key.remoteJid);
+                            if (!nameMap.has(normalizedId)) {
+                                nameMap.set(normalizedId, m.pushName);
+                            }
+                        }
+                    });
+                }
+
+                console.log(`[SYNC] 📇 Mapeados ${nameMap.size} nomes`);
+
+                // ========================================
+                // ETAPA 1: POPULAR CHATS (OBRIGATÓRIO PRIMEIRO)
+                // ========================================
+                console.log("[SYNC] 📁 ETAPA 1/2: Populando CHATS...");
+                
+                const privateChats = chats.filter(c => 
+                    c.id && 
+                    !c.id.includes("@g.us") && 
+                    !c.id.includes("broadcast")
+                );
+
+                const CHAT_BATCH_SIZE = 50;
+                const totalChats = privateChats.length;
+                let processedChats = 0;
+
+                for (let i = 0; i < totalChats; i += CHAT_BATCH_SIZE) {
+                    const batch = privateChats.slice(i, i + CHAT_BATCH_SIZE);
                     
-                    let timestamp = c.conversationTimestamp ? Number(c.conversationTimestamp) : Date.now() / 1000;
-                    if (timestamp < 946684800000) timestamp *= 1000;
+                    const chatRecords = batch.map(chat => {
+                        const normalizedId = jidNormalizedUser(chat.id);
+                        const phone = normalizedId.split('@')[0];
+                        const name = nameMap.get(normalizedId) || chat.name || phone;
+                        
+                        let timestamp = chat.conversationTimestamp 
+                            ? Number(chat.conversationTimestamp) 
+                            : Date.now() / 1000;
+                        
+                        if (timestamp < 946684800000) timestamp *= 1000;
 
-                    return {
-                        id: id,
-                        name: name,
-                        phone: id.split('@')[0],
-                        unread_count: c.unreadCount || 0,
-                        is_archived: c.archived || false,
-                        last_message_time: timestamp,
-                        is_group: false // Como filtramos !@g.us, é false
-                    };
-                });
+                        return {
+                            id: normalizedId,
+                            name: name,
+                            phone: phone,
+                            unread_count: chat.unreadCount || 0,
+                            is_archived: chat.archived || false,
+                            last_message_time: timestamp,
+                            is_group: false
+                        };
+                    });
 
-                // Upsert garantindo que o chat exista antes das mensagens
-                const { error } = await supabase.from("chats").upsert(batchChats, { onConflict: 'id' });
-                if (error) console.error(`[SYNC - ERRO CHATS] Lote ${i}:`, error.message);
-            }
-            console.log("[SYNC - ETAPA 1] ✅ Todos os chats foram salvos.");
+                    // Salvar lote no banco
+                    const { error } = await supabase
+                        .from("chats")
+                        .upsert(chatRecords, { 
+                            onConflict: 'id',
+                            ignoreDuplicates: false 
+                        });
 
-            // ==================================================================================
-            // ETAPA 2: POPULAR MENSAGENS (LOTE 50) - SÓ RODA APÓS ETAPA 1
-            // ==================================================================================
-            const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
-            const MSG_BATCH_SIZE = 50; 
-
-            console.log(`[SYNC - ETAPA 2] 📨 Processando ${privateMessages.length} mensagens...`);
-
-            for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
-                const chunk = privateMessages.slice(i, i + MSG_BATCH_SIZE);
-                // Prepara e filtra mensagens inválidas
-                const batchMsgs = chunk
-                    .map(m => prepareMessageForDB(m, m.key.remoteJid))
-                    .filter(item => item !== null);
-                
-                if (batchMsgs.length > 0) {
-                    const { error } = await supabase.from("messages").upsert(batchMsgs, { onConflict: 'id' });
                     if (error) {
-                        // Loga erro mas continua, pode ser duplicidade ou erro pontual
-                        console.error(`[SYNC - ERRO MSG] Lote ${i}:`, error.message);
+                        console.error(`[SYNC] ❌ Erro ao salvar chats (lote ${i}):`, error.message);
+                    } else {
+                        processedChats += chatRecords.length;
                     }
-                }
-                
-                // Progresso e pausa para não travar CPU
-                if (i % 500 === 0 && i > 0) console.log(`[SYNC] Msg Progresso: ${i}/${privateMessages.length}`);
-                await new Promise(r => setTimeout(r, 50)); 
-            }
 
-            console.log("[SYNC - ETAPA 2] ✅ Mensagens salvas.");
-            
-            // FIM
-            await updateStatusInDb("connected", null, sock?.user?.id)
-            console.log("[SYNC] 🏁 Sincronização Finalizada!")
-            if (global.gc) global.gc()
+                    // LIMPAR MEMÓRIA a cada lote
+                    batch.length = 0;
+                    chatRecords.length = 0;
+                    
+                    // Log de progresso
+                    if (processedChats % 200 === 0 || processedChats === totalChats) {
+                        console.log(`[SYNC] 📊 Chats: ${processedChats}/${totalChats}`);
+                    }
+
+                    // Yield para event loop + GC manual se disponível
+                    await new Promise(r => setTimeout(r, 10));
+                    if (global.gc) global.gc();
+                }
+
+                console.log(`[SYNC] ✅ ETAPA 1 COMPLETA: ${processedChats} chats salvos`);
+
+                // Limpar array de chats da memória
+                privateChats.length = 0;
+                nameMap.clear();
+
+                // Force GC antes de processar mensagens
+                if (global.gc) global.gc();
+
+                // ========================================
+                // ETAPA 2: POPULAR MENSAGENS (APÓS CHATS)
+                // ========================================
+                console.log("[SYNC] 📨 ETAPA 2/2: Populando MENSAGENS...");
+                
+                const privateMessages = messages.filter(m => 
+                    m.key.remoteJid && 
+                    !m.key.remoteJid.includes("@g.us") &&
+                    m.key.remoteJid !== "status@broadcast"
+                );
+
+                const MSG_BATCH_SIZE = 50;
+                const totalMessages = privateMessages.length;
+                let processedMessages = 0;
+
+                for (let i = 0; i < totalMessages; i += MSG_BATCH_SIZE) {
+                    const batch = privateMessages.slice(i, i + MSG_BATCH_SIZE);
+                    
+                    const messageRecords = batch
+                        .map(msg => prepareMessageForDB(msg, msg.key.remoteJid))
+                        .filter(m => m !== null);
+
+                    if (messageRecords.length > 0) {
+                        const { error } = await supabase
+                            .from("messages")
+                            .upsert(messageRecords, { 
+                                onConflict: 'id',
+                                ignoreDuplicates: false
+                            });
+
+                        if (error) {
+                            console.error(`[SYNC] ❌ Erro ao salvar mensagens (lote ${i}):`, error.message);
+                        } else {
+                            processedMessages += messageRecords.length;
+                        }
+                    }
+
+                    // LIMPAR MEMÓRIA a cada lote
+                    batch.length = 0;
+                    messageRecords.length = 0;
+
+                    // Log de progresso
+                    if (processedMessages % 500 === 0 || i + MSG_BATCH_SIZE >= totalMessages) {
+                        console.log(`[SYNC] 📊 Mensagens: ${processedMessages}/${totalMessages}`);
+                    }
+
+                    // Yield para event loop + GC manual
+                    await new Promise(r => setTimeout(r, 10));
+                    if (global.gc) global.gc();
+                }
+
+                console.log(`[SYNC] ✅ ETAPA 2 COMPLETA: ${processedMessages} mensagens salvas`);
+
+                // Limpar array de mensagens da memória
+                privateMessages.length = 0;
+
+                // ========================================
+                // FINALIZAÇÃO
+                // ========================================
+                await updateStatusInDb("connected", null, sock?.user?.id);
+                
+                console.log("[SYNC] 🎉 SINCRONIZAÇÃO FINALIZADA!");
+                console.log(`[SYNC] 📊 Resumo: ${processedChats} chats + ${processedMessages} mensagens`);
+                
+                // Garbage collection final
+                if (global.gc) {
+                    global.gc();
+                    console.log("[SYNC] 🗑️ Memória liberada");
+                }
+
+            } catch (error) {
+                console.error("[SYNC] ❌ Erro crítico na sincronização:", error);
+                await updateStatusInDb("connected", null, sock?.user?.id);
+            }
         })
 
         // Eventos Tempo Real (Mantém atualizado pós-sync)
