@@ -11,19 +11,16 @@ const {
     DisconnectReason,
     makeCacheableSignalKeyStore,
     downloadMediaMessage,
-    jidNormalizedUser // IMPORTANTE: Para normalizar IDs
+    jidNormalizedUser 
 } = require("@whiskeysockets/baileys")
 const qrcode = require("qrcode")
 const fs = require('fs')
 
 const app = express()
 app.use(cors())
-
-// Aumentando limite de payload para evitar erros em mensagens pesadas
 app.use(express.json({ limit: '50mb' }))
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
-// CONFIGURAÇÃO SUPABASE
 const supabaseUrl = process.env.SUPABASE_URL
 const supabaseKey = process.env.SUPABASE_KEY
 
@@ -36,11 +33,11 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
     auth: { persistSession: false }
 })
 
-// ESTADO
 let sock = null
 let isStarting = false
 let lastQrDataUrl = null
 let qrTimeout = null
+let contactStore = {} // Cache global de nomes
 
 const connectionStatus = {
     connected: false,
@@ -48,13 +45,8 @@ const connectionStatus = {
     status: "disconnected",
 }
 
-// Cache simples em memória apenas para referência rápida
-let contactStore = {}
-
-// --- FUNÇÃO DE STATUS DO BANCO ---
 async function updateStatusInDb(status, qrCode = null, phone = null) {
     try {
-        console.log(`[DB] Atualizando status para: ${status}`)
         const { error } = await supabase.from("instance_settings").upsert({
             id: 1,
             status: status,
@@ -66,25 +58,16 @@ async function updateStatusInDb(status, qrCode = null, phone = null) {
     } catch (err) { console.error("[DB] Erro:", err) }
 }
 
-// --- FUNÇÕES AUXILIARES DE TRATAMENTO ---
-
 function getMessageText(msg) {
     if (!msg || !msg.message) return ""
     const content = msg.message
-    
-    // Prioridades de texto
     if (content.conversation) return content.conversation
     if (content.extendedTextMessage?.text) return content.extendedTextMessage.text
     if (content.imageMessage?.caption) return content.imageMessage.caption || "[Imagem]"
     if (content.videoMessage?.caption) return content.videoMessage.caption || "[Vídeo]"
     if (content.documentMessage?.caption) return content.documentMessage.caption || "[Documento]"
-    
-    // Tipos especiais
     if (content.audioMessage) return "[Áudio]"
     if (content.stickerMessage) return "[Sticker]"
-    if (content.protocolMessage && content.protocolMessage.type === 0) return "[Mensagem Revogada]"
-    if (content.reactionMessage) return `[Reação: ${content.reactionMessage.text}]`
-    
     return ""
 }
 
@@ -95,7 +78,6 @@ function getMessageType(msg) {
     return found ? found.replace("Message", "") : "text";
 }
 
-// Função segura para sanitizar valores (undefined quebra o JSON do Supabase)
 const safeVal = (val) => (val === undefined ? null : val);
 
 function prepareMessageForDB(msg, chatId) {
@@ -119,17 +101,12 @@ function prepareMessageForDB(msg, chatId) {
                         iv: messageContent.iv ? Buffer.from(messageContent.iv).toString('base64') : null,
                     }
                 }
-            } catch (e) {
-                console.error("Erro processando mediaMeta:", e)
-            }
+            } catch (e) { }
         }
 
         const textContent = getMessageText(msg);
-
-        // Se não tem texto e não tem mídia, retorna null para filtrar
         if (!textContent && !hasMedia) return null;
 
-        // Tratamento seguro de Timestamp
         let ts = Number(msg.messageTimestamp);
         if (isNaN(ts) || ts === 0) ts = Math.floor(Date.now() / 1000);
         
@@ -138,7 +115,7 @@ function prepareMessageForDB(msg, chatId) {
             chat_id: chatId,
             sender_id: msg.key.participant || msg.key.remoteJid || chatId,
             content: textContent,
-            timestamp: ts * 1000, // JS usa ms
+            timestamp: ts * 1000,
             from_me: msg.key.fromMe || false,
             type: type,
             has_media: hasMedia,
@@ -146,12 +123,10 @@ function prepareMessageForDB(msg, chatId) {
             ack: msg.status || 0
         }
     } catch (err) {
-        console.error("Erro fatal preparando mensagem:", msg.key.id, err);
         return null;
     }
 }
 
-// --- WHATSAPP START ---
 async function startWhatsApp(isManualStart = false) {
     if (sock?.user || isStarting) return;
 
@@ -191,7 +166,6 @@ async function startWhatsApp(isManualStart = false) {
         if (isManualStart) {
             qrTimeout = setTimeout(async () => {
                 if (!sock?.user) {
-                    console.log("[TIMEOUT] ⏰ Tempo esgotado.");
                     try { sock.end(undefined); } catch (e) {}
                     sock = null;
                     isStarting = false;
@@ -200,8 +174,8 @@ async function startWhatsApp(isManualStart = false) {
             }, 5 * 60 * 1000);
         }
 
-        // Cache local simples
         sock.ev.on("contacts.upsert", (contacts) => {
+            // Atualiza cache global silenciosamente
             contacts.forEach(c => { 
                 if (c.id && (c.name || c.notify)) {
                     contactStore[jidNormalizedUser(c.id)] = c.name || c.notify;
@@ -209,101 +183,102 @@ async function startWhatsApp(isManualStart = false) {
             })
         })
 
-        // --- SINCRONIZAÇÃO EM LOTES COM MERGE (CORRIGIDO) ---
+        // --- SINCRONIZAÇÃO OTIMIZADA (MERGE PER BATCH) ---
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
-            console.log(`[SYNC] 🌊 Iniciando sync: ${chats.length} chats, ${contacts.length} contatos, ${messages.length} msgs.`)
+            console.log(`[SYNC] 🌊 Dados Brutos: ${chats.length} chats, ${contacts.length} contatos.`);
             if (qrTimeout) clearTimeout(qrTimeout);
 
-            // =====================================================================
-            // PASSO 1: CRIAR O "DICIONÁRIO MESTRE" DE NOMES (RAM)
-            // =====================================================================
-            const nameMap = {};
+            // 1. DEBUG: Vamos ver como o contato está chegando
+            if (contacts.length > 0) {
+                console.log("[DEBUG] Exemplo de Contato:", JSON.stringify(contacts[0], null, 2));
+            }
 
-            // 1.1: Preenche com a Agenda (Prioridade: Nome Salvo)
+            // 2. PREPARAÇÃO DO MAPA (RAM - Rápido e Obrigatório)
+            // Precisamos iterar todos os contatos 1 vez para saber quem é quem
+            const nameMap = {};
+            
             contacts.forEach(c => {
-                const name = c.name || c.notify || c.verifiedName;
+                // Tentamos todas as propriedades possíveis onde o nome se esconde
+                const name = c.name || c.notify || c.verifiedName || c.short;
                 if (name && c.id) {
                     nameMap[jidNormalizedUser(c.id)] = name;
                 }
             });
 
-            // 1.2: Preenche buracos com PushName das Mensagens
+            // Extrai PushNames de mensagens para preencher buracos
             messages.forEach(m => {
                 if (m.pushName && m.key.remoteJid) {
                     const id = jidNormalizedUser(m.key.remoteJid);
-                    // Só usa pushName se não tiver nome na agenda
-                    if (!nameMap[id]) {
-                        nameMap[id] = m.pushName;
-                    }
+                    if (!nameMap[id]) nameMap[id] = m.pushName;
                 }
             });
-
-            // Atualiza o cache global também
+            
+            // Atualiza o store global
             Object.assign(contactStore, nameMap);
+            console.log(`[SYNC] 📇 Mapa de Nomes construído: ${Object.keys(nameMap).length} entradas.`);
 
-            // =====================================================================
-            // PASSO 2: MESCLAR E SALVAR CHATS
-            // =====================================================================
+            // 3. PROCESSAMENTO E ENVIO EM LOTES (MERGE REAL-TIME)
             const privateChats = chats.filter(c => !c.id.includes("@g.us") && !c.id.includes("broadcast"));
-            console.log(`[SYNC] Mesclando dados de ${privateChats.length} chats...`);
-
-            const chatsParaBanco = privateChats.map(chat => {
-                const id = jidNormalizedUser(chat.id);
-                // BUSCA O NOME NO MAPA JÁ POPULADO
-                const finalName = nameMap[id] || chat.name || id.split('@')[0];
-
-                let timestamp = chat.conversationTimestamp ? Number(chat.conversationTimestamp) : Date.now() / 1000;
-                if (timestamp < 946684800000) timestamp *= 1000;
-                
-                return {
-                    id: id,
-                    name: finalName,
-                    phone: id.split('@')[0],
-                    unread_count: chat.unreadCount || 0,
-                    is_archived: chat.archived || false,
-                    last_message_time: timestamp,
-                    is_group: false
-                };
-            });
-
-            // Inserção em Lotes (Chats)
             const CHAT_BATCH_SIZE = 100;
-            for (let i = 0; i < chatsParaBanco.length; i += CHAT_BATCH_SIZE) {
-                const batch = chatsParaBanco.slice(i, i + CHAT_BATCH_SIZE);
-                const { error } = await supabase.from("chats").upsert(batch, { onConflict: 'id' });
-                if (error) console.error(`[SYNC] ❌ Erro ao salvar lote de chats ${i}:`, error.message);
-            }
-            console.log("[SYNC] ✅ Chats salvos com nomes.");
 
-            // =====================================================================
-            // PASSO 3: SALVAR MENSAGENS
-            // =====================================================================
+            console.log(`[SYNC] Iniciando processamento de ${privateChats.length} chats em lotes...`);
+
+            for (let i = 0; i < privateChats.length; i += CHAT_BATCH_SIZE) {
+                // 3.1 Pega o lote "cru" (apenas ID e metadados básicos)
+                const rawBatch = privateChats.slice(i, i + CHAT_BATCH_SIZE);
+                
+                // 3.2 MESCLA: Cria o objeto final APENAS para este lote
+                const processedBatch = rawBatch.map(chat => {
+                    const id = jidNormalizedUser(chat.id);
+                    // Procura no Mapa Global
+                    const finalName = nameMap[id] || contactStore[id] || chat.name || id.split('@')[0];
+
+                    let timestamp = chat.conversationTimestamp ? Number(chat.conversationTimestamp) : Date.now() / 1000;
+                    if (timestamp < 946684800000) timestamp *= 1000;
+
+                    return {
+                        id: id,
+                        name: finalName, // Nome resolvido aqui
+                        phone: id.split('@')[0],
+                        unread_count: chat.unreadCount || 0,
+                        is_archived: chat.archived || false,
+                        last_message_time: timestamp,
+                        is_group: false
+                    };
+                });
+
+                // 3.3 Envia o lote mesclado
+                const { error } = await supabase.from("chats").upsert(processedBatch, { onConflict: 'id' });
+                
+                if (error) {
+                    console.error(`[SYNC] ❌ Erro lote ${i}:`, error.message);
+                }
+
+                // 3.4 Libera memória imediatamente
+                // O Garbage Collector do JS vai pegar isso assim que possível
+            }
+            console.log("[SYNC] ✅ Chats processados e enviados.");
+
+            // 4. MENSAGENS (Lotes)
             const privateMessages = messages.filter(m => m.key.remoteJid && !m.key.remoteJid.includes("@g.us"));
             const MSG_BATCH_SIZE = 50; 
 
-            console.log(`[SYNC] Salvando ${privateMessages.length} mensagens...`);
-
             for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
                 const chunk = privateMessages.slice(i, i + MSG_BATCH_SIZE);
-                const batch = chunk.map(m => prepareMessageForDB(m, m.key.remoteJid)).filter(item => item !== null);
+                const batch = chunk.map(m => prepareMessageForDB(m, m.key.remoteJid)).filter(i => i !== null);
                 
                 if (batch.length > 0) {
                     await supabase.from("messages").upsert(batch, { onConflict: 'id' });
                 }
-                
-                if (i % 500 === 0 && i > 0) console.log(`[SYNC] Msg Progresso: ${i}/${privateMessages.length}`);
-                
-                // Pequeno delay para aliviar o banco
                 if (i % 200 === 0) await new Promise(r => setTimeout(r, 20)); 
             }
 
-            // 4. FASE FINAL
             await updateStatusInDb("connected", null, sock?.user?.id)
             console.log("[SYNC] ✅ Sincronização COMPLETA.")
             if (global.gc) global.gc()
         })
 
-        // Eventos Tempo Real (Simplificado: Apenas salva a mensagem)
+        // Eventos Tempo Real
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
             if (type !== "notify" && type !== "append") return
             for (const msg of messages) {
@@ -319,37 +294,27 @@ async function startWhatsApp(isManualStart = false) {
 
         sock.ev.on("connection.update", async (update) => {
             const { connection, lastDisconnect, qr } = update
-            
             if (qr) {
                 lastQrDataUrl = await qrcode.toDataURL(qr)
                 connectionStatus.status = "qr"
-                console.log("[STATUS] 📱 QR Code")
                 await updateStatusInDb("qr", lastQrDataUrl, null)
             }
-            
             if (connection === "open") {
                 if (qrTimeout) clearTimeout(qrTimeout);
                 connectionStatus.connected = true
                 connectionStatus.phone = sock.user?.id
                 connectionStatus.status = "connected"
                 lastQrDataUrl = null
-                console.log("[WHATSAPP] ✅ Conectado")
-                // Apenas status, a carga pesada fica no history.set
                 await updateStatusInDb("connected", null, sock.user?.id)
             }
-            
             if (connection === "close") {
                 const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
                 connectionStatus.connected = false
                 connectionStatus.status = "disconnected"
                 lastQrDataUrl = null
-                
-                console.log("[STATUS] ❌ Desconectado. Razão:", reason)
                 await updateStatusInDb("disconnected", null, null)
-
                 const hasSession = fs.existsSync("./auth_info/creds.json");
                 if (reason !== DisconnectReason.loggedOut && hasSession) {
-                    console.log("🔄 Reconectando...");
                     isStarting = false
                     setTimeout(() => startWhatsApp(false), 3000)
                 } else {
@@ -358,7 +323,6 @@ async function startWhatsApp(isManualStart = false) {
                 }
             }
         })
-
     } catch (err) {
         console.error("Erro start:", err)
         await updateStatusInDb("error", null, null)
@@ -377,18 +341,13 @@ const handleShutdown = async (signal) => {
 process.on('SIGINT', () => handleShutdown('SIGINT'));
 process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
-// --- ROTAS HTTP ---
-
 app.get("/", (req, res) => res.send("WhatsApp API Online 🚀")); 
-
 app.post("/session/connect", async (req, res) => {
-    console.log("[API] Solicitando conexão manual...");
     if (sock) { try { sock.end(undefined); sock = null; } catch(e){} }
     isStarting = false;
     startWhatsApp(true); 
     res.json({ success: true });
 });
-
 app.post("/session/disconnect", async (req, res) => {
     try {
         if (sock) await sock.logout();
@@ -399,14 +358,12 @@ app.post("/session/disconnect", async (req, res) => {
         res.json({ success: true });
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
-
 app.get("/health", (req, res) => res.json({ ok: true, status: connectionStatus }))
 app.get("/qr", (req, res) => {
     if (connectionStatus.connected) return res.send("ALREADY_CONNECTED")
     if (!lastQrDataUrl) return res.status(202).send("QR_NOT_READY")
     return res.send(lastQrDataUrl)
 })
-
 app.get("/chats/avatar/:chatId", async (req, res) => {
     const { chatId } = req.params;
     try {
@@ -420,8 +377,6 @@ app.get("/chats/avatar/:chatId", async (req, res) => {
         res.send(buffer);
     } catch (error) { res.status(500).send("Erro interno"); }
 });
-
-// ... Rotas de chats, messages, media ...
 app.get("/chats", async (req, res) => { 
     const limit = Number(req.query.limit) || 20
     const offset = Number(req.query.offset) || 0
@@ -432,7 +387,6 @@ app.get("/chats", async (req, res) => {
         res.json({ success: true, chats: formattedChats, hasMore: (offset + limit) < count, total: count })
     } catch (error) { res.status(500).json({ success: false, chats: [] }) }
 })
-
 app.get("/chats/:chatId/messages", async (req, res) => { 
     const { chatId } = req.params
     const limit = Number(req.query.limit) || 20
@@ -445,7 +399,6 @@ app.get("/chats/:chatId/messages", async (req, res) => {
         res.json({ success: true, messages: formattedMsgs, hasMore: (offset + limit) < count, total: count })
     } catch (error) { res.status(500).json({ success: false, messages: [] }) }
 })
-
 app.get("/media/:chatId/:messageId", async (req, res) => { 
     const { chatId, messageId } = req.params
     if (chatId.includes("@g.us")) return res.status(403).send("Bloqueado")
@@ -459,7 +412,6 @@ app.get("/media/:chatId/:messageId", async (req, res) => {
         res.send(buffer)
     } catch (error) { res.status(500).send("Erro mídia") }
 })
-
 app.post("/chats/send", async (req, res) => {
     const { chatId, message } = req.body
     if (!connectionStatus.connected || !sock) return res.status(400).json({ success: false })
@@ -468,6 +420,5 @@ app.post("/chats/send", async (req, res) => {
         res.json({ success: true, messageId: result?.key?.id })
     } catch (error) { res.status(500).json({ success: false, error: error.message }) }
 })
-
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => console.log(`[SERVER] 🌐 Porta ${PORT}`))
