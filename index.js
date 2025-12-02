@@ -162,6 +162,38 @@ function resolveChatName(chatId, chatName, pushName) {
     return chatId.split('@')[0];
 }
 
+// Função para buscar nomes de contatos ativamente
+async function fetchContactNames(jids) {
+    if (!sock || !jids || jids.length === 0) return {}
+    
+    const nameMap = {}
+    const BATCH_SIZE = 30 // WhatsApp tem limite de consultas
+    
+    for (let i = 0; i < jids.length; i += BATCH_SIZE) {
+        const batch = jids.slice(i, i + BATCH_SIZE)
+        try {
+            // onWhatsApp retorna informações do contato incluindo se existe e o notify name
+            const results = await sock.onWhatsApp(...batch.map(jid => jid.split('@')[0]))
+            
+            if (results) {
+                results.forEach(result => {
+                    if (result.jid && result.exists) {
+                        // Tenta buscar informações adicionais do contato
+                        nameMap[result.jid] = result.jid.split('@')[0]
+                    }
+                })
+            }
+            
+            // Pequeno delay para não sobrecarregar
+            await new Promise(r => setTimeout(r, 100))
+        } catch (error) {
+            console.error(`[FETCH_NAMES] Erro no lote ${i}:`, error.message)
+        }
+    }
+    
+    return nameMap
+}
+
 // --- WHATSAPP START ---
 async function startWhatsApp(isManualStart = false) {
     if (sock?.user || isStarting) return;
@@ -221,16 +253,43 @@ async function startWhatsApp(isManualStart = false) {
             console.log(`[SYNC] 🌊 Recebido: ${chats.length} chats, ${messages.length} msgs.`)
             if (qrTimeout) clearTimeout(qrTimeout);
 
-            // 1. Carrega contatos
-            if (contacts) {
-                contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
+            // 1. Carrega contatos vindos do sync
+            if (contacts && contacts.length > 0) {
+                console.log(`[SYNC] Processando ${contacts.length} contatos...`)
+                contacts.forEach(c => {
+                    const name = c.name || c.notify || c.verifiedName
+                    if (name && c.id) {
+                        contactStore[c.id] = name
+                    }
+                })
             }
 
-            // 2. PIPELINE DE CHATS
+            // 2. Extrai pushNames das mensagens (mais confiável)
+            const pushNameMap = {}
+            messages.forEach(m => {
+                if (m.pushName && m.key.remoteJid && !m.key.remoteJid.includes('@g.us')) {
+                    const jid = m.key.remoteJid
+                    if (!pushNameMap[jid]) {
+                        pushNameMap[jid] = m.pushName
+                        contactStore[jid] = m.pushName
+                    }
+                }
+            })
+            console.log(`[SYNC] Extraídos ${Object.keys(pushNameMap).length} nomes de mensagens`)
+
+            // 3. PIPELINE DE CHATS
             const privateChats = chats.filter(c => !c.id.includes("@g.us"));
             const CHAT_BATCH_SIZE = 25;
             
             console.log(`[SYNC] Salvando ${privateChats.length} chats...`);
+
+            // 3.1 Busca nomes ativos para chats sem nome
+            const chatsWithoutName = privateChats.filter(c => !pushNameMap[c.id] && !contactStore[c.id] && !c.name)
+            if (chatsWithoutName.length > 0) {
+                console.log(`[SYNC] Buscando nomes para ${chatsWithoutName.length} contatos...`)
+                const fetchedNames = await fetchContactNames(chatsWithoutName.map(c => c.id))
+                Object.assign(contactStore, fetchedNames)
+            }
 
             for (let i = 0; i < privateChats.length; i += CHAT_BATCH_SIZE) {
                 const chunk = privateChats.slice(i, i + CHAT_BATCH_SIZE);
@@ -238,12 +297,15 @@ async function startWhatsApp(isManualStart = false) {
                 let batch = chunk.map(c => {
                     let timestamp = c.conversationTimestamp ? Number(c.conversationTimestamp) : 0;
                     if (timestamp > 0 && timestamp < 946684800000) timestamp = timestamp * 1000;
-                    if (timestamp === 0) timestamp = 1000; 
+                    if (timestamp === 0) timestamp = 1000;
+                    
+                    // Ordem de prioridade: pushName > c.name > contactStore > telefone
+                    const finalName = pushNameMap[c.id] || c.name || contactStore[c.id] || c.id.split('@')[0]
 
                     return {
                         id: c.id,
                         phone: c.id.split('@')[0],
-                        name: resolveChatName(c.id, c.name, null), 
+                        name: finalName, 
                         unread_count: c.unreadCount || 0,
                         is_group: false,
                         is_archived: c.archived || false,
@@ -307,8 +369,17 @@ async function startWhatsApp(isManualStart = false) {
                 
                 if (msgDB) {
                     await supabase.from("messages").upsert(msgDB)
-                    if (!contactStore[chatId] && msg.pushName) {
-                         await supabase.from("chats").update({ name: msg.pushName }).eq("id", chatId)
+                    
+                    // Atualiza nome se pushName estiver presente
+                    if (msg.pushName && !msg.key.fromMe) {
+                        const currentName = contactStore[chatId]
+                        const isPhoneNumber = currentName && /^\d+$/.test(currentName)
+                        
+                        // Só atualiza se não tiver nome OU se o nome atual for apenas número
+                        if (!currentName || isPhoneNumber) {
+                            contactStore[chatId] = msg.pushName
+                            await supabase.from("chats").update({ name: msg.pushName }).eq("id", chatId)
+                        }
                     }
                 }
             }
