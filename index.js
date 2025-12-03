@@ -17,8 +17,6 @@ const fs = require('fs')
 
 const app = express()
 app.use(cors())
-
-// Aumentando limite de payload para garantir recebimento de mídias grandes
 app.use(express.json({ limit: '50mb' }))
 app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
@@ -35,52 +33,81 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
     auth: { persistSession: false }
 })
 
-// ESTADO
+// ============================================================
+// 🔒 ESTADO GLOBAL
+// ============================================================
 let sock = null
-let isStarting = false
 let lastQrDataUrl = null
 let qrTimeout = null
-let hasSyncedHistory = false // ✅ FLAG para evitar múltiplas sincronizações
 
-const connectionStatus = {
-    connected: false,
-    phone: null,
-    status: "disconnected",
-}
+// Flags de controle (mutex simples)
+let isInitializing = false
+let hasSyncedHistory = false
+let currentStatus = "disconnected"
 
 let contactStore = {}
 
-// GARANTE QUE A PASTA DE SESSÃO EXISTE
+// Garante pasta de sessão
 if (!fs.existsSync('./auth_info')) {
-    fs.mkdirSync('./auth_info', { recursive: true });
+    fs.mkdirSync('./auth_info', { recursive: true })
 }
 
-// --- FUNÇÃO DE STATUS DO BANCO ---
-async function updateStatusInDb(status, qrCode = null, phone = null) {
+// ============================================================
+// 📡 ATUALIZAÇÃO DE STATUS EM TEMPO REAL
+// ============================================================
+// STATUS:
+//   "disconnected" → Desconectado
+//   "qr"           → QR Code aguardando escaneamento  
+//   "syncing"      → Sincronizando histórico
+//   "connected"    → Conectado e pronto
+// ============================================================
+async function updateStatus(newStatus, qrCode = null, phone = null) {
+    // Evita atualizações duplicadas
+    if (currentStatus === newStatus && newStatus !== "qr") {
+        return
+    }
+    
+    currentStatus = newStatus
+    
+    const info = {
+        disconnected: "🔴 Desconectado",
+        qr: "📱 QR Code aguardando escaneamento",
+        syncing: "🔄 Sincronizando mensagens",
+        connected: "🟢 Conectado e pronto"
+    }
+    
+    console.log(`[STATUS] ${info[newStatus] || newStatus}`)
+    
     try {
-        console.log(`[DB] 📝 Atualizando status para: ${status}`)
-        const { error } = await supabase.from("instance_settings").upsert({
-            id: 1,
-            status: status,
-            qr_code: qrCode,
-            phone: phone,
-            updated_at: new Date()
-        })
-        if (error) console.error("[DB] Erro status:", error.message)
-    } catch (err) { console.error("[DB] Erro:", err) }
+        const { error } = await supabase
+            .from("instance_settings")
+            .upsert({
+                id: 1,
+                status: newStatus,
+                qr_code: newStatus === "qr" ? qrCode : null,
+                phone: phone || null,
+                updated_at: new Date().toISOString()
+            })
+        
+        if (error) console.error("[DB] Erro:", error.message)
+    } catch (err) {
+        console.error("[DB] Erro:", err.message)
+    }
 }
 
-// --- FUNÇÕES AUXILIARES ---
+// ============================================================
+// 🛠️ FUNÇÕES AUXILIARES
+// ============================================================
 function getMessageText(msg) {
-    if (!msg || !msg.message) return ""
-    const content = msg.message
-    if (content.conversation) return content.conversation
-    if (content.extendedTextMessage?.text) return content.extendedTextMessage.text
-    if (content.imageMessage?.caption) return content.imageMessage.caption
-    if (content.videoMessage?.caption) return content.videoMessage.caption
-    if (content.documentMessage?.caption) return content.documentMessage.caption
-    if (content.audioMessage) return "🎵 Áudio"
-    if (content.stickerMessage) return "🏷️ Sticker"
+    if (!msg?.message) return ""
+    const c = msg.message
+    if (c.conversation) return c.conversation
+    if (c.extendedTextMessage?.text) return c.extendedTextMessage.text
+    if (c.imageMessage?.caption) return c.imageMessage.caption
+    if (c.videoMessage?.caption) return c.videoMessage.caption
+    if (c.documentMessage?.caption) return c.documentMessage.caption
+    if (c.audioMessage) return "🎵 Áudio"
+    if (c.stickerMessage) return "🏷️ Sticker"
     return ""
 }
 
@@ -100,15 +127,15 @@ function prepareMessageForDB(msg, chatId) {
     let mediaMeta = null
 
     if (hasMedia) {
-        const mediaMsg = msg.message?.imageMessage || msg.message?.videoMessage || 
-                         msg.message?.audioMessage || msg.message?.documentMessage || 
-                         msg.message?.stickerMessage
-        if (mediaMsg) {
+        const m = msg.message?.imageMessage || msg.message?.videoMessage || 
+                  msg.message?.audioMessage || msg.message?.documentMessage || 
+                  msg.message?.stickerMessage
+        if (m) {
             mediaMeta = {
-                mimetype: mediaMsg.mimetype || null,
-                fileLength: mediaMsg.fileLength ? Number(mediaMsg.fileLength) : null,
-                fileName: mediaMsg.fileName || null,
-                seconds: mediaMsg.seconds || null,
+                mimetype: m.mimetype || null,
+                fileLength: m.fileLength ? Number(m.fileLength) : null,
+                fileName: m.fileName || null,
+                seconds: m.seconds || null,
             }
         }
     }
@@ -127,372 +154,360 @@ function prepareMessageForDB(msg, chatId) {
 }
 
 function resolveChatName(chatId, chatName, pushName) {
-    if (chatName && chatName.trim() !== "" && !chatName.includes("@")) {
-        return chatName;
-    }
-    if (contactStore[chatId]) {
-        return contactStore[chatId];
-    }
-    if (pushName && pushName.trim() !== "") {
-        return pushName;
-    }
-    return chatId.split("@")[0];
+    if (chatName?.trim() && !chatName.includes("@")) return chatName
+    if (contactStore[chatId]) return contactStore[chatId]
+    if (pushName?.trim()) return pushName
+    return chatId.split("@")[0]
 }
 
-// --- WHATSAPP START ---
-async function startWhatsApp(isManualStart = false) {
-    if (isStarting) {
-        console.log("[START] Já existe uma inicialização em andamento...");
-        return;
+// ============================================================
+// 🚀 INICIALIZAÇÃO DO WHATSAPP
+// ============================================================
+async function startWhatsApp() {
+    // LOCK: Evita múltiplas inicializações
+    if (isInitializing) {
+        console.log("[START] ⚠️ Já inicializando, ignorando...")
+        return
     }
-    isStarting = true;
-    hasSyncedHistory = false; // ✅ Reset flag ao iniciar nova conexão
+    
+    isInitializing = true
+    hasSyncedHistory = false
+    
+    console.log("[WHATSAPP] 🚀 Iniciando...")
 
-    console.log("[WHATSAPP] Iniciando...");
+    // Limpa socket anterior
     if (sock) {
-        sock.ev.removeAllListeners();
-        sock = null;
+        try {
+            sock.ev.removeAllListeners()
+            sock.end()
+        } catch (e) {}
+        sock = null
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState("./auth_info");
-    const { version } = await fetchLatestBaileysVersion();
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState("./auth_info")
+        const { version } = await fetchLatestBaileysVersion()
 
-    sock = makeWASocket({
-        version,
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
-        },
-        printQRInTerminal: false,
-        logger: pino({ level: "silent" }),
-        browser: ["Chrome", "Desktop", "3.0"],
-        syncFullHistory: true,
-        keepAliveIntervalMs: 30000,
-        connectTimeoutMs: 60000,
-        defaultQueryTimeoutMs: undefined,
-        emitOwnEvents: true,
-        markOnlineOnConnect: true,
-        getMessage: async () => undefined,
-    });
+        sock = makeWASocket({
+            version,
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
+            },
+            printQRInTerminal: false,
+            logger: pino({ level: "silent" }),
+            browser: ["Chrome", "Desktop", "3.0"],
+            syncFullHistory: true,
+            keepAliveIntervalMs: 30000,
+            connectTimeoutMs: 60000,
+            emitOwnEvents: true,
+            markOnlineOnConnect: true,
+            getMessage: async () => undefined,
+        })
 
-    sock.ev.on("creds.update", saveCreds);
+        sock.ev.on("creds.update", saveCreds)
 
-    // --- SINCRONIZAÇÃO EM LOTES (PIPELINE) ---
-    sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest }) => {
-        // ✅ EVITA MÚLTIPLAS SINCRONIZAÇÕES - VERIFICAÇÃO NO INÍCIO
-        if (hasSyncedHistory) {
-            console.log(`[SYNC] ⏭️ Ignorando sync adicional (já sincronizado). Recebido: ${messages.length} msgs.`)
-            return
-        }
+        // ========================================
+        // 📶 CONEXÃO
+        // ========================================
+        sock.ev.on("connection.update", async (update) => {
+            const { connection, lastDisconnect, qr } = update
+            
+            // QR CODE
+            if (qr) {
+                lastQrDataUrl = await qrcode.toDataURL(qr)
+                await updateStatus("qr", lastQrDataUrl, null)
+            }
+            
+            // CONEXÃO ABERTA → SYNCING
+            if (connection === "open") {
+                if (qrTimeout) clearTimeout(qrTimeout)
+                lastQrDataUrl = null
+                await updateStatus("syncing", null, sock.user?.id)
+            }
+            
+            // CONEXÃO FECHADA
+            if (connection === "close") {
+                const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
+                
+                lastQrDataUrl = null
+                hasSyncedHistory = false
+                isInitializing = false
+                
+                await updateStatus("disconnected", null, null)
 
-        // ✅ MARCA IMEDIATAMENTE para evitar race conditions
-        hasSyncedHistory = true
-
-        console.log(`[SYNC] 🌊 Recebido: ${chats.length} chats, ${messages.length} msgs. isLatest: ${isLatest}`)
-        if (qrTimeout) clearTimeout(qrTimeout);
-
-        if (contacts) {
-            contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
-        }
-
-        // Popular contactStore também dos pushNames das mensagens
-        messages.forEach(m => {
-            if (m.pushName) {
-                const senderId = m.key.participant || m.key.remoteJid
-                if (!contactStore[senderId]) {
-                    contactStore[senderId] = m.pushName
+                // Reconecta se não foi logout
+                const hasSession = fs.existsSync("./auth_info/creds.json")
+                if (statusCode !== DisconnectReason.loggedOut && hasSession) {
+                    console.log("[WHATSAPP] 🔄 Reconectando em 5s...")
+                    setTimeout(() => startWhatsApp(), 5000)
+                } else {
+                    sock = null
                 }
             }
         })
 
-        // ✅ FILTRO DE 6 MESES
-        const SIX_MONTHS_MS = 6 * 30 * 24 * 60 * 60 * 1000 // ~180 dias
-        const cutoffTimestamp = Date.now() - SIX_MONTHS_MS
+        // ========================================
+        // 📚 SINCRONIZAÇÃO (APENAS 1 VEZ)
+        // ========================================
+        sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
+            // LOCK: Ignora syncs adicionais silenciosamente
+            if (hasSyncedHistory) return
+            hasSyncedHistory = true
 
-        // 1. CHATS (Lotes de 25)
-        const privateChats = chats.filter(c => !c.id.includes("@g.us"));
-        const CHAT_BATCH_SIZE = 25;
-        
-        console.log(`[SYNC] Salvando ${privateChats.length} chats...`);
+            console.log(`[SYNC] 📚 Recebido: ${chats.length} chats, ${messages.length} msgs`)
 
-        for (let i = 0; i < privateChats.length; i += CHAT_BATCH_SIZE) {
-            let batch = privateChats.slice(i, i + CHAT_BATCH_SIZE).map(c => {
-                let timestamp = c.conversationTimestamp ? Number(c.conversationTimestamp) : 0;
-                if (timestamp > 0 && timestamp < 946684800000) timestamp = timestamp * 1000;
-                if (timestamp === 0) timestamp = 1000; 
+            // Popula contatos
+            contacts?.forEach(c => { if (c.name) contactStore[c.id] = c.name })
+            messages.forEach(m => {
+                if (m.pushName) {
+                    const id = m.key.participant || m.key.remoteJid
+                    if (!contactStore[id]) contactStore[id] = m.pushName
+                }
+            })
 
-                return {
-                    id: c.id,
-                    name: resolveChatName(c.id, c.name, null), 
-                    unread_count: c.unreadCount || 0,
-                    is_group: false,
-                    is_archived: c.archived || false,
-                    last_message_time: timestamp, 
-                };
-            });
+            // Filtro 6 meses
+            const cutoff = Date.now() - (6 * 30 * 24 * 60 * 60 * 1000)
 
-            const { error } = await supabase.from("chats").upsert(batch, { onConflict: 'id' });
-            if (error) console.error(`[SYNC] Erro Chats Lote ${i}:`, error.message);
-            
-            batch = null; 
-            await new Promise(r => setTimeout(r, 100)); 
-        }
+            // CHATS
+            const privateChats = chats.filter(c => !c.id.includes("@g.us"))
+            console.log(`[SYNC] 💬 Salvando ${privateChats.length} chats...`)
 
-        // 2. MENSAGENS (Lotes de 50) - COM FILTRO DE 6 MESES
-        const privateMessages = messages.filter(m => {
-            if (!m.key.remoteJid || m.key.remoteJid.includes("@g.us")) return false
-            
-            // Filtro de 6 meses
-            const msgTimestamp = Number(m.messageTimestamp) * 1000
-            return msgTimestamp >= cutoffTimestamp
-        });
-        
-        const MSG_BATCH_SIZE = 50;
+            for (let i = 0; i < privateChats.length; i += 25) {
+                const batch = privateChats.slice(i, i + 25).map(c => {
+                    let ts = c.conversationTimestamp ? Number(c.conversationTimestamp) : 0
+                    if (ts > 0 && ts < 946684800000) ts *= 1000
+                    if (ts === 0) ts = 1000
 
-        // Log útil para debug
-        const totalFiltered = messages.length - privateMessages.length
-        console.log(`[SYNC] Salvando ${privateMessages.length} mensagens (${totalFiltered} filtradas por idade/grupo)...`);
+                    return {
+                        id: c.id,
+                        name: resolveChatName(c.id, c.name, null),
+                        unread_count: c.unreadCount || 0,
+                        is_group: false,
+                        is_archived: c.archived || false,
+                        last_message_time: ts,
+                    }
+                })
 
-        for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
-            let batch = privateMessages.slice(i, i + MSG_BATCH_SIZE).map(m => prepareMessageForDB(m, m.key.remoteJid));
-            
-            const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' });
-            if (error) console.error(`[SYNC] Erro Msgs Lote ${i}:`, error.message);
-            
-            if (i % 500 === 0 && i > 0) console.log(`[SYNC] Progresso: ${i}/${privateMessages.length} msgs.`);
-
-            batch = null; 
-            if (global.gc && i % 1000 === 0) global.gc();
-
-            await new Promise(r => setTimeout(r, 200)); 
-        }
-        
-        // ✅ ATUALIZA STATUS PARA CONNECTED
-        await updateStatusInDb("connected", null, sock?.user?.id)
-        console.log("[SYNC] ✅ Sincronização COMPLETA. Status alterado para: connected")
-        
-        if (global.gc) global.gc()
-    })
-
-    // --- MENSAGENS EM TEMPO REAL ---
-    sock.ev.on("messages.upsert", async ({ messages, type }) => {
-        if (type !== "notify" && type !== "append") return
-        for (const msg of messages) {
-            const chatId = msg.key.remoteJid
-            if (!chatId || chatId.includes("@g.us") || chatId === "status@broadcast") continue
-
-            const msgDB = prepareMessageForDB(msg, chatId)
-            const { error } = await supabase.from("messages").upsert(msgDB, { onConflict: 'id' })
-            if (error) console.error("[MSG] Erro ao salvar:", error.message)
-        }
-    })
-
-    // --- ATUALIZAÇÃO DE STATUS DA CONEXÃO ---
-    sock.ev.on("connection.update", async (update) => {
-        const { connection, lastDisconnect, qr } = update
-        
-        if (qr) {
-            lastQrDataUrl = await qrcode.toDataURL(qr)
-            connectionStatus.status = "qr"
-            console.log("[STATUS] 📱 QR Code gerado. Status alterado para: qr")
-            await updateStatusInDb("qr", lastQrDataUrl, null)
-        }
-        
-        if (connection === "open") {
-            if (qrTimeout) clearTimeout(qrTimeout);
-            connectionStatus.connected = true
-            connectionStatus.phone = sock.user?.id
-            connectionStatus.status = "syncing"
-            lastQrDataUrl = null
-            
-            // ✅ ALTERA PARA SYNCING ASSIM QUE CONECTAR
-            console.log("[WHATSAPP] ✅ Socket conectado. Status alterado para: syncing")
-            await updateStatusInDb("syncing", null, sock.user?.id)
-        }
-        
-        if (connection === "close") {
-            const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
-            connectionStatus.connected = false
-            connectionStatus.status = "disconnected"
-            lastQrDataUrl = null
-            hasSyncedHistory = false // ✅ Reset flag ao desconectar
-            
-            console.log("[STATUS] ❌ Desconectado. Razão:", reason, "- Status alterado para: disconnected")
-            await updateStatusInDb("disconnected", null, null)
-
-            const hasSession = fs.existsSync("./auth_info/creds.json");
-            if (reason !== DisconnectReason.loggedOut && hasSession) {
-                console.log("🔄 Reconectando...");
-                isStarting = false
-                setTimeout(() => startWhatsApp(false), 3000)
-            } else {
-                isStarting = false
-                sock = null
+                const { error } = await supabase.from("chats").upsert(batch, { onConflict: 'id' })
+                if (error) console.error("[SYNC] Erro chats:", error.message)
+                await new Promise(r => setTimeout(r, 100))
             }
-        }
-    })
 
-    isStarting = false;
+            // MENSAGENS
+            const privateMsgs = messages.filter(m => {
+                if (!m.key.remoteJid || m.key.remoteJid.includes("@g.us")) return false
+                return Number(m.messageTimestamp) * 1000 >= cutoff
+            })
+
+            console.log(`[SYNC] 📝 Salvando ${privateMsgs.length} mensagens...`)
+
+            for (let i = 0; i < privateMsgs.length; i += 50) {
+                const batch = privateMsgs.slice(i, i + 50).map(m => 
+                    prepareMessageForDB(m, m.key.remoteJid)
+                )
+
+                const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' })
+                if (error) console.error("[SYNC] Erro msgs:", error.message)
+                
+                if (i > 0 && i % 500 === 0) {
+                    console.log(`[SYNC] 📊 ${Math.round((i / privateMsgs.length) * 100)}%`)
+                }
+                
+                await new Promise(r => setTimeout(r, 200))
+            }
+
+            // FINALIZADO → CONNECTED
+            await updateStatus("connected", null, sock?.user?.id)
+            console.log("[SYNC] ✅ Sincronização completa!")
+        })
+
+        // ========================================
+        // 💬 MENSAGENS EM TEMPO REAL
+        // ========================================
+        sock.ev.on("messages.upsert", async ({ messages, type }) => {
+            if (type !== "notify" && type !== "append") return
+
+            for (const msg of messages) {
+                const chatId = msg.key.remoteJid
+                if (!chatId || chatId.includes("@g.us") || chatId === "status@broadcast") continue
+
+                const msgDB = prepareMessageForDB(msg, chatId)
+                await supabase.from("messages").upsert(msgDB, { onConflict: 'id' })
+            }
+        })
+
+        isInitializing = false
+
+    } catch (error) {
+        console.error("[START] ❌ Erro:", error.message)
+        isInitializing = false
+        await updateStatus("disconnected", null, null)
+    }
 }
 
-startWhatsApp(false);
+// ============================================================
+// 🔌 INICIALIZAÇÃO
+// ============================================================
+startWhatsApp()
 
-const handleShutdown = async (signal) => {
-    console.log(`\n[SHUTDOWN] Recebido ${signal}. Encerrando...`);
-    await updateStatusInDb("disconnected", null, null);
+const shutdown = async (signal) => {
+    console.log(`[SERVER] 🛑 ${signal} - Encerrando...`)
+    await updateStatus("disconnected", null, null)
     if (sock) {
-        sock.ev.removeAllListeners();
-        sock.end();
+        sock.ev.removeAllListeners()
+        sock.end()
     }
-    process.exit(0);
-};
-process.on('SIGINT', () => handleShutdown('SIGINT'));
-process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+    process.exit(0)
+}
 
-// --- ROTAS HTTP ---
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
 
-app.get("/", (req, res) => res.send("WhatsApp API Online 🚀")); 
+// ============================================================
+// 🌐 ROTAS HTTP
+// ============================================================
+app.get("/", (req, res) => res.send("WhatsApp API Online 🚀"))
+
+app.get("/health", (req, res) => res.json({ ok: true, status: currentStatus }))
+
+app.get("/qr", (req, res) => {
+    res.json({ 
+        qr: currentStatus === "qr" ? lastQrDataUrl : null, 
+        status: currentStatus 
+    })
+})
 
 app.post("/session/connect", async (req, res) => {
-    try {
-        hasSyncedHistory = false; // ✅ Reset flag ao solicitar nova conexão
-        await startWhatsApp(true);
-        res.json({ success: true, message: "Iniciando conexão..." });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+    if (currentStatus === "connected" || currentStatus === "syncing") {
+        return res.json({ success: true, message: "Já conectado", status: currentStatus })
     }
-});
+    
+    if (currentStatus === "qr") {
+        return res.json({ success: true, message: "QR disponível", status: "qr" })
+    }
+    
+    isInitializing = false
+    hasSyncedHistory = false
+    startWhatsApp()
+    
+    res.json({ success: true, message: "Iniciando..." })
+})
 
 app.post("/session/disconnect", async (req, res) => {
     try {
-        if (sock) {
-            sock.logout();
-        }
-        // Limpa a pasta de autenticação
+        isInitializing = false
+        hasSyncedHistory = false
+        
+        if (sock) await sock.logout()
+        
         if (fs.existsSync("./auth_info")) {
-            fs.rmSync("./auth_info", { recursive: true, force: true });
-            fs.mkdirSync("./auth_info", { recursive: true });
+            fs.rmSync("./auth_info", { recursive: true, force: true })
+            fs.mkdirSync("./auth_info", { recursive: true })
         }
-        hasSyncedHistory = false; // ✅ Reset flag ao desconectar
-        await updateStatusInDb("disconnected", null, null);
-        res.json({ success: true, message: "Desconectado" });
+        
+        await updateStatus("disconnected", null, null)
+        sock = null
+        
+        res.json({ success: true, message: "Desconectado" })
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-app.get("/health", (req, res) => res.json({ ok: true, status: connectionStatus }))
-
-app.get("/qr", (req, res) => {
-    if (lastQrDataUrl) {
-        res.json({ qr: lastQrDataUrl })
-    } else {
-        res.status(404).json({ error: "QR não disponível" })
+        res.status(500).json({ success: false, error: error.message })
     }
 })
 
-// ROTA PROXY DE AVATAR (O Backend baixa e entrega a imagem real)
 app.get("/chats/avatar/:chatId", async (req, res) => {
     try {
-        const { chatId } = req.params;
-        if (!sock || connectionStatus.status !== "connected") {
-            return res.status(503).json({ error: "WhatsApp não conectado" });
+        if (!sock || currentStatus !== "connected") {
+            return res.status(503).json({ error: "Não conectado" })
         }
-        const url = await sock.profilePictureUrl(chatId, "image").catch(() => null);
-        if (!url) {
-            return res.status(404).json({ error: "Avatar não encontrado" });
-        }
-        const response = await fetch(url);
-        const buffer = await response.arrayBuffer();
-        res.set("Content-Type", response.headers.get("content-type") || "image/jpeg");
-        res.set("Cache-Control", "public, max-age=86400");
-        res.send(Buffer.from(buffer));
+        
+        const url = await sock.profilePictureUrl(req.params.chatId, "image").catch(() => null)
+        if (!url) return res.status(404).json({ error: "Não encontrado" })
+        
+        const response = await fetch(url)
+        res.set("Content-Type", response.headers.get("content-type") || "image/jpeg")
+        res.set("Cache-Control", "public, max-age=86400")
+        res.send(Buffer.from(await response.arrayBuffer()))
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: error.message })
     }
-});
+})
 
 app.get("/chats", async (req, res) => {
     try {
         const { data, error } = await supabase
             .from("chats")
             .select("*")
-            .order("last_message_time", { ascending: false });
-        if (error) throw error;
-        res.json(data);
+            .order("last_message_time", { ascending: false })
+        
+        if (error) throw error
+        res.json(data)
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: error.message })
     }
-});
+})
 
 app.get("/chats/:chatId/messages", async (req, res) => {
     try {
-        const { chatId } = req.params;
-        const { limit = 50, before } = req.query;
+        const { chatId } = req.params
+        const { limit = 50, before } = req.query
         
         let query = supabase
             .from("messages")
             .select("*")
             .eq("chat_id", chatId)
             .order("timestamp", { ascending: false })
-            .limit(Number(limit));
+            .limit(Number(limit))
         
-        if (before) {
-            query = query.lt("timestamp", Number(before));
-        }
+        if (before) query = query.lt("timestamp", Number(before))
         
-        const { data, error } = await query;
-        if (error) throw error;
-        res.json(data);
+        const { data, error } = await query
+        if (error) throw error
+        res.json(data)
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: error.message })
     }
-});
+})
 
 app.get("/media/:chatId/:messageId", async (req, res) => {
     try {
-        const { chatId, messageId } = req.params;
-        
-        if (!sock || connectionStatus.status !== "connected") {
-            return res.status(503).json({ error: "WhatsApp não conectado" });
+        if (!sock || currentStatus !== "connected") {
+            return res.status(503).json({ error: "Não conectado" })
         }
         
-        // Busca a mensagem no store do Baileys
-        const msg = await sock.loadMessage(chatId, messageId);
-        if (!msg) {
-            return res.status(404).json({ error: "Mensagem não encontrada" });
-        }
+        const msg = await sock.loadMessage(req.params.chatId, req.params.messageId)
+        if (!msg) return res.status(404).json({ error: "Não encontrada" })
         
-        const buffer = await downloadMediaMessage(msg, "buffer", {});
-        const mediaMsg = msg.message?.imageMessage || msg.message?.videoMessage || 
-                         msg.message?.audioMessage || msg.message?.documentMessage;
+        const buffer = await downloadMediaMessage(msg, "buffer", {})
+        const media = msg.message?.imageMessage || msg.message?.videoMessage || 
+                      msg.message?.audioMessage || msg.message?.documentMessage
         
-        res.set("Content-Type", mediaMsg?.mimetype || "application/octet-stream");
-        res.set("Cache-Control", "public, max-age=86400");
-        res.send(buffer);
+        res.set("Content-Type", media?.mimetype || "application/octet-stream")
+        res.set("Cache-Control", "public, max-age=86400")
+        res.send(buffer)
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: error.message })
     }
-});
+})
 
 app.post("/chats/send", async (req, res) => {
     try {
-        const { chatId, message } = req.body;
+        const { chatId, message } = req.body
         
-        if (!sock || connectionStatus.status !== "connected") {
-            return res.status(503).json({ error: "WhatsApp não conectado" });
+        if (!sock || currentStatus !== "connected") {
+            return res.status(503).json({ error: "Não conectado" })
         }
         
         if (!chatId || !message) {
-            return res.status(400).json({ error: "chatId e message são obrigatórios" });
+            return res.status(400).json({ error: "chatId e message obrigatórios" })
         }
         
-        const result = await sock.sendMessage(chatId, { text: message });
-        res.json({ success: true, messageId: result.key.id });
+        const result = await sock.sendMessage(chatId, { text: message })
+        res.json({ success: true, messageId: result.key.id })
     } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.status(500).json({ error: error.message })
     }
-});
+})
 
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => console.log(`[SERVER] 🌐 Porta ${PORT}`))
