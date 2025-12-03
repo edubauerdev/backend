@@ -33,81 +33,90 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
     auth: { persistSession: false }
 })
 
-// ============================================================
-// 🔒 ESTADO GLOBAL
-// ============================================================
+// ESTADO
 let sock = null
 let lastQrDataUrl = null
 let qrTimeout = null
-
-// Flags de controle (mutex simples)
-let isInitializing = false
 let hasSyncedHistory = false
-let currentStatus = "disconnected"
+let isStarting = false  // ← ÚNICO LOCK NECESSÁRIO
+
+const connectionStatus = {
+    connected: false,
+    phone: null,
+    status: "disconnected",
+}
 
 let contactStore = {}
 
-// Garante pasta de sessão
+// GARANTE QUE A PASTA DE SESSÃO EXISTE
 if (!fs.existsSync('./auth_info')) {
-    fs.mkdirSync('./auth_info', { recursive: true })
+    fs.mkdirSync('./auth_info', { recursive: true });
 }
 
 // ============================================================
-// 📡 ATUALIZAÇÃO DE STATUS EM TEMPO REAL
+// 📡 FUNÇÃO DE ATUALIZAÇÃO DE STATUS - TEMPO REAL
 // ============================================================
-// STATUS:
-//   "disconnected" → Desconectado
-//   "qr"           → QR Code aguardando escaneamento  
-//   "syncing"      → Sincronizando histórico
-//   "connected"    → Conectado e pronto
-// ============================================================
-async function updateStatus(newStatus, qrCode = null, phone = null) {
-    // Evita atualizações duplicadas
-    if (currentStatus === newStatus && newStatus !== "qr") {
-        return
+async function updateStatus(newStatus, qrCode = null, phone = null, extraInfo = null) {
+    connectionStatus.status = newStatus
+    connectionStatus.connected = (newStatus === "connected" || newStatus === "syncing")
+    connectionStatus.phone = phone
+    
+    const statusEmojis = {
+        disconnected: "🔴",
+        qr: "📱",
+        syncing: "🔄",
+        connected: "🟢"
     }
     
-    currentStatus = newStatus
-    
-    const info = {
-        disconnected: "🔴 Desconectado",
-        qr: "📱 QR Code aguardando escaneamento",
-        syncing: "🔄 Sincronizando mensagens",
-        connected: "🟢 Conectado e pronto"
+    const statusMessages = {
+        disconnected: "Desconectado",
+        qr: "QR Code aguardando escaneamento",
+        syncing: "Conectado - Sincronizando mensagens",
+        connected: "Conectado e pronto"
     }
     
-    console.log(`[STATUS] ${info[newStatus] || newStatus}`)
+    console.log(`[STATUS] ${statusEmojis[newStatus]} ${statusMessages[newStatus]}${extraInfo ? ` (${extraInfo})` : ''}`)
     
     try {
+        const updateData = {
+            id: 1,
+            status: newStatus,
+            updated_at: new Date().toISOString()
+        }
+        
+        if (newStatus === "qr" && qrCode) {
+            updateData.qr_code = qrCode
+        } else if (newStatus !== "qr") {
+            updateData.qr_code = null
+        }
+        
+        if (phone) {
+            updateData.phone = phone
+        }
+        
         const { error } = await supabase
             .from("instance_settings")
-            .upsert({
-                id: 1,
-                status: newStatus,
-                qr_code: newStatus === "qr" ? qrCode : null,
-                phone: phone || null,
-                updated_at: new Date().toISOString()
-            })
+            .upsert(updateData)
         
-        if (error) console.error("[DB] Erro:", error.message)
+        if (error) {
+            console.error("[STATUS] ❌ Erro ao atualizar no banco:", error.message)
+        }
     } catch (err) {
-        console.error("[DB] Erro:", err.message)
+        console.error("[STATUS] ❌ Erro:", err.message)
     }
 }
 
-// ============================================================
-// 🛠️ FUNÇÕES AUXILIARES
-// ============================================================
+// --- FUNÇÕES AUXILIARES ---
 function getMessageText(msg) {
-    if (!msg?.message) return ""
-    const c = msg.message
-    if (c.conversation) return c.conversation
-    if (c.extendedTextMessage?.text) return c.extendedTextMessage.text
-    if (c.imageMessage?.caption) return c.imageMessage.caption
-    if (c.videoMessage?.caption) return c.videoMessage.caption
-    if (c.documentMessage?.caption) return c.documentMessage.caption
-    if (c.audioMessage) return "🎵 Áudio"
-    if (c.stickerMessage) return "🏷️ Sticker"
+    if (!msg || !msg.message) return ""
+    const content = msg.message
+    if (content.conversation) return content.conversation
+    if (content.extendedTextMessage?.text) return content.extendedTextMessage.text
+    if (content.imageMessage?.caption) return content.imageMessage.caption
+    if (content.videoMessage?.caption) return content.videoMessage.caption
+    if (content.documentMessage?.caption) return content.documentMessage.caption
+    if (content.audioMessage) return "🎵 Áudio"
+    if (content.stickerMessage) return "🏷️ Sticker"
     return ""
 }
 
@@ -121,24 +130,10 @@ function getMessageType(msg) {
     return "text"
 }
 
+// ✅ CORRIGIDO: Removido media_metadata que não existe no banco
 function prepareMessageForDB(msg, chatId) {
     const type = getMessageType(msg)
     const hasMedia = ["image", "video", "audio", "document", "sticker"].includes(type)
-    let mediaMeta = null
-
-    if (hasMedia) {
-        const m = msg.message?.imageMessage || msg.message?.videoMessage || 
-                  msg.message?.audioMessage || msg.message?.documentMessage || 
-                  msg.message?.stickerMessage
-        if (m) {
-            mediaMeta = {
-                mimetype: m.mimetype || null,
-                fileLength: m.fileLength ? Number(m.fileLength) : null,
-                fileName: m.fileName || null,
-                seconds: m.seconds || null,
-            }
-        }
-    }
 
     return {
         id: msg.key.id,
@@ -146,47 +141,52 @@ function prepareMessageForDB(msg, chatId) {
         sender: msg.key.fromMe ? "me" : (msg.key.participant || chatId),
         content: getMessageText(msg),
         timestamp: Number(msg.messageTimestamp) * 1000,
-        is_from_me: msg.key.fromMe || false,
+        from_me: msg.key.fromMe || false,  // ← CORRIGIDO: era is_from_me
         type: type,
         has_media: hasMedia,
-        media_metadata: mediaMeta,
     }
 }
 
 function resolveChatName(chatId, chatName, pushName) {
-    if (chatName?.trim() && !chatName.includes("@")) return chatName
-    if (contactStore[chatId]) return contactStore[chatId]
-    if (pushName?.trim()) return pushName
-    return chatId.split("@")[0]
+    if (chatName && chatName.trim() !== "" && !chatName.includes("@")) {
+        return chatName;
+    }
+    if (contactStore[chatId]) {
+        return contactStore[chatId];
+    }
+    if (pushName && pushName.trim() !== "") {
+        return pushName;
+    }
+    return chatId.split("@")[0];
 }
 
 // ============================================================
-// 🚀 INICIALIZAÇÃO DO WHATSAPP
+// 🚀 WHATSAPP START - FUNÇÃO PRINCIPAL
 // ============================================================
 async function startWhatsApp() {
-    // LOCK: Evita múltiplas inicializações
-    if (isInitializing) {
-        console.log("[START] ⚠️ Já inicializando, ignorando...")
-        return
+    // ✅ LOCK ÚNICO E SIMPLES
+    if (isStarting) {
+        console.log("[START] ⚠️ Já existe uma inicialização em andamento...");
+        return;
     }
     
-    isInitializing = true
+    isStarting = true
     hasSyncedHistory = false
-    
-    console.log("[WHATSAPP] 🚀 Iniciando...")
 
-    // Limpa socket anterior
+    console.log("[WHATSAPP] 🚀 Iniciando conexão...");
+    
+    // Limpa socket anterior se existir
     if (sock) {
         try {
-            sock.ev.removeAllListeners()
-            sock.end()
+            sock.ev.removeAllListeners();
+            sock.end();
         } catch (e) {}
-        sock = null
+        sock = null;
     }
 
     try {
-        const { state, saveCreds } = await useMultiFileAuthState("./auth_info")
-        const { version } = await fetchLatestBaileysVersion()
+        const { state, saveCreds } = await useMultiFileAuthState("./auth_info");
+        const { version } = await fetchLatestBaileysVersion();
 
         sock = makeWASocket({
             version,
@@ -200,46 +200,51 @@ async function startWhatsApp() {
             syncFullHistory: true,
             keepAliveIntervalMs: 30000,
             connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: undefined,
             emitOwnEvents: true,
             markOnlineOnConnect: true,
             getMessage: async () => undefined,
-        })
+        });
 
-        sock.ev.on("creds.update", saveCreds)
+        sock.ev.on("creds.update", saveCreds);
 
-        // ========================================
-        // 📶 CONEXÃO
-        // ========================================
+        // ============================================================
+        // 📨 EVENTO: ATUALIZAÇÃO DE CONEXÃO
+        // ============================================================
         sock.ev.on("connection.update", async (update) => {
             const { connection, lastDisconnect, qr } = update
             
-            // QR CODE
+            // 📱 QR CODE GERADO
             if (qr) {
                 lastQrDataUrl = await qrcode.toDataURL(qr)
                 await updateStatus("qr", lastQrDataUrl, null)
             }
             
-            // CONEXÃO ABERTA → SYNCING
+            // ✅ CONEXÃO ABERTA
             if (connection === "open") {
-                if (qrTimeout) clearTimeout(qrTimeout)
+                if (qrTimeout) clearTimeout(qrTimeout);
                 lastQrDataUrl = null
-                await updateStatus("syncing", null, sock.user?.id)
+                isStarting = false  // ← LIBERA LOCK
+                
+                const phoneId = sock.user?.id
+                await updateStatus("syncing", null, phoneId, "Iniciando sincronização")
             }
             
-            // CONEXÃO FECHADA
+            // ❌ CONEXÃO FECHADA
             if (connection === "close") {
                 const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
+                const reason = DisconnectReason[statusCode] || statusCode
                 
                 lastQrDataUrl = null
                 hasSyncedHistory = false
-                isInitializing = false
+                isStarting = false  // ← LIBERA LOCK
                 
-                await updateStatus("disconnected", null, null)
+                await updateStatus("disconnected", null, null, `Razão: ${reason}`)
 
-                // Reconecta se não foi logout
-                const hasSession = fs.existsSync("./auth_info/creds.json")
+                // ✅ RECONEXÃO APENAS SE TEM SESSÃO VÁLIDA E NÃO FOI LOGOUT
+                const hasSession = fs.existsSync("./auth_info/creds.json");
                 if (statusCode !== DisconnectReason.loggedOut && hasSession) {
-                    console.log("[WHATSAPP] 🔄 Reconectando em 5s...")
+                    console.log("[WHATSAPP] 🔄 Reconectando em 5 segundos...");
                     setTimeout(() => startWhatsApp(), 5000)
                 } else {
                     sock = null
@@ -247,267 +252,333 @@ async function startWhatsApp() {
             }
         })
 
-        // ========================================
-        // 📚 SINCRONIZAÇÃO (APENAS 1 VEZ)
-        // ========================================
-        sock.ev.on("messaging-history.set", async ({ chats, contacts, messages }) => {
-            // LOCK: Ignora syncs adicionais silenciosamente
-            if (hasSyncedHistory) return
+        // ============================================================
+        // 📚 EVENTO: SINCRONIZAÇÃO DE HISTÓRICO
+        // ============================================================
+        sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest }) => {
+            if (hasSyncedHistory) {
+                console.log(`[SYNC] ⏭️ Ignorando sync adicional. Recebido: ${messages.length} msgs.`)
+                return
+            }
+
             hasSyncedHistory = true
 
-            console.log(`[SYNC] 📚 Recebido: ${chats.length} chats, ${messages.length} msgs`)
+            console.log(`[SYNC] 📚 Recebido: ${chats.length} chats, ${messages.length} msgs.`)
+            if (qrTimeout) clearTimeout(qrTimeout);
 
-            // Popula contatos
-            contacts?.forEach(c => { if (c.name) contactStore[c.id] = c.name })
+            if (contacts) {
+                contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
+            }
             messages.forEach(m => {
                 if (m.pushName) {
-                    const id = m.key.participant || m.key.remoteJid
-                    if (!contactStore[id]) contactStore[id] = m.pushName
+                    const senderId = m.key.participant || m.key.remoteJid
+                    if (!contactStore[senderId]) {
+                        contactStore[senderId] = m.pushName
+                    }
                 }
             })
 
-            // Filtro 6 meses
-            const cutoff = Date.now() - (6 * 30 * 24 * 60 * 60 * 1000)
+            const SIX_MONTHS_MS = 6 * 30 * 24 * 60 * 60 * 1000
+            const cutoffTimestamp = Date.now() - SIX_MONTHS_MS
 
-            // CHATS
-            const privateChats = chats.filter(c => !c.id.includes("@g.us"))
-            console.log(`[SYNC] 💬 Salvando ${privateChats.length} chats...`)
+            // 1. SALVAR CHATS
+            const privateChats = chats.filter(c => !c.id.includes("@g.us"));
+            const CHAT_BATCH_SIZE = 25;
+            
+            console.log(`[SYNC] 💬 Salvando ${privateChats.length} chats...`);
 
-            for (let i = 0; i < privateChats.length; i += 25) {
-                const batch = privateChats.slice(i, i + 25).map(c => {
-                    let ts = c.conversationTimestamp ? Number(c.conversationTimestamp) : 0
-                    if (ts > 0 && ts < 946684800000) ts *= 1000
-                    if (ts === 0) ts = 1000
+            for (let i = 0; i < privateChats.length; i += CHAT_BATCH_SIZE) {
+                let batch = privateChats.slice(i, i + CHAT_BATCH_SIZE).map(c => {
+                    let timestamp = c.conversationTimestamp ? Number(c.conversationTimestamp) : 0;
+                    if (timestamp > 0 && timestamp < 946684800000) timestamp = timestamp * 1000;
+                    if (timestamp === 0) timestamp = 1000; 
 
                     return {
                         id: c.id,
-                        name: resolveChatName(c.id, c.name, null),
+                        name: resolveChatName(c.id, c.name, null), 
                         unread_count: c.unreadCount || 0,
                         is_group: false,
                         is_archived: c.archived || false,
-                        last_message_time: ts,
-                    }
-                })
+                        last_message_time: timestamp, 
+                    };
+                });
 
-                const { error } = await supabase.from("chats").upsert(batch, { onConflict: 'id' })
-                if (error) console.error("[SYNC] Erro chats:", error.message)
-                await new Promise(r => setTimeout(r, 100))
+                const { error } = await supabase.from("chats").upsert(batch, { onConflict: 'id' });
+                if (error) console.error(`[SYNC] Erro Chats:`, error.message);
+                
+                batch = null; 
+                await new Promise(r => setTimeout(r, 100)); 
             }
 
-            // MENSAGENS
-            const privateMsgs = messages.filter(m => {
+            // 2. SALVAR MENSAGENS
+            const privateMessages = messages.filter(m => {
                 if (!m.key.remoteJid || m.key.remoteJid.includes("@g.us")) return false
-                return Number(m.messageTimestamp) * 1000 >= cutoff
-            })
+                const msgTimestamp = Number(m.messageTimestamp) * 1000
+                return msgTimestamp >= cutoffTimestamp
+            });
+            
+            const MSG_BATCH_SIZE = 50;
+            const totalFiltered = messages.length - privateMessages.length
+            console.log(`[SYNC] 📝 Salvando ${privateMessages.length} mensagens (${totalFiltered} filtradas)...`);
 
-            console.log(`[SYNC] 📝 Salvando ${privateMsgs.length} mensagens...`)
-
-            for (let i = 0; i < privateMsgs.length; i += 50) {
-                const batch = privateMsgs.slice(i, i + 50).map(m => 
-                    prepareMessageForDB(m, m.key.remoteJid)
-                )
-
-                const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' })
-                if (error) console.error("[SYNC] Erro msgs:", error.message)
+            for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
+                let batch = privateMessages.slice(i, i + MSG_BATCH_SIZE).map(m => prepareMessageForDB(m, m.key.remoteJid));
                 
-                if (i > 0 && i % 500 === 0) {
-                    console.log(`[SYNC] 📊 ${Math.round((i / privateMsgs.length) * 100)}%`)
+                const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' });
+                if (error) console.error(`[SYNC] Erro Msgs:`, error.message);
+                
+                if (i % 500 === 0 && i > 0) {
+                    const percent = Math.round((i / privateMessages.length) * 100)
+                    console.log(`[SYNC] 📊 Progresso: ${percent}% (${i}/${privateMessages.length})`);
                 }
-                
-                await new Promise(r => setTimeout(r, 200))
-            }
 
-            // FINALIZADO → CONNECTED
-            await updateStatus("connected", null, sock?.user?.id)
-            console.log("[SYNC] ✅ Sincronização completa!")
+                batch = null; 
+                if (global.gc && i % 1000 === 0) global.gc();
+                await new Promise(r => setTimeout(r, 200)); 
+            }
+            
+            await updateStatus("connected", null, sock?.user?.id, "Sincronização completa")
+            console.log("[SYNC] ✅ Sincronização finalizada com sucesso!")
+            
+            if (global.gc) global.gc()
         })
 
-        // ========================================
-        // 💬 MENSAGENS EM TEMPO REAL
-        // ========================================
+        // ============================================================
+        // 💬 EVENTO: MENSAGENS EM TEMPO REAL
+        // ============================================================
         sock.ev.on("messages.upsert", async ({ messages, type }) => {
             if (type !== "notify" && type !== "append") return
-
+            
             for (const msg of messages) {
                 const chatId = msg.key.remoteJid
                 if (!chatId || chatId.includes("@g.us") || chatId === "status@broadcast") continue
 
                 const msgDB = prepareMessageForDB(msg, chatId)
-                await supabase.from("messages").upsert(msgDB, { onConflict: 'id' })
+                const { error } = await supabase.from("messages").upsert(msgDB, { onConflict: 'id' })
+                if (error) console.error("[MSG] Erro:", error.message)
             }
         })
 
-        isInitializing = false
-
     } catch (error) {
-        console.error("[START] ❌ Erro:", error.message)
-        isInitializing = false
-        await updateStatus("disconnected", null, null)
+        console.error("[START] ❌ Erro ao iniciar:", error.message)
+        await updateStatus("disconnected", null, null, `Erro: ${error.message}`)
+        isStarting = false
     }
 }
 
 // ============================================================
-// 🔌 INICIALIZAÇÃO
+// 🔌 INICIALIZAÇÃO - SÓ CONECTA SE TEM SESSÃO SALVA
 // ============================================================
-startWhatsApp()
+const hasExistingSession = fs.existsSync("./auth_info/creds.json");
+if (hasExistingSession) {
+    console.log("[INIT] 📂 Sessão encontrada, reconectando automaticamente...");
+    startWhatsApp();
+} else {
+    console.log("[INIT] 📂 Nenhuma sessão encontrada. Aguardando /session/connect...");
+    updateStatus("disconnected", null, null, "Aguardando conexão manual");
+}
 
-const shutdown = async (signal) => {
-    console.log(`[SERVER] 🛑 ${signal} - Encerrando...`)
-    await updateStatus("disconnected", null, null)
+const handleShutdown = async (signal) => {
+    console.log(`\n[SHUTDOWN] Recebido ${signal}. Encerrando...`);
+    await updateStatus("disconnected", null, null, "Servidor encerrado")
     if (sock) {
-        sock.ev.removeAllListeners()
-        sock.end()
+        sock.ev.removeAllListeners();
+        sock.end();
     }
-    process.exit(0)
-}
-
-process.on('SIGTERM', () => shutdown('SIGTERM'))
-process.on('SIGINT', () => shutdown('SIGINT'))
+    process.exit(0);
+};
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
 // ============================================================
 // 🌐 ROTAS HTTP
 // ============================================================
-app.get("/", (req, res) => res.send("WhatsApp API Online 🚀"))
 
-app.get("/health", (req, res) => res.json({ ok: true, status: currentStatus }))
+app.get("/", (req, res) => res.send("WhatsApp API Online 🚀")); 
+
+app.get("/health", (req, res) => res.json({ 
+    ok: true, 
+    status: connectionStatus.status,
+    connected: connectionStatus.connected,
+    phone: connectionStatus.phone
+}))
 
 app.get("/qr", (req, res) => {
-    res.json({ 
-        qr: currentStatus === "qr" ? lastQrDataUrl : null, 
-        status: currentStatus 
-    })
+    if (connectionStatus.status === "qr" && lastQrDataUrl) {
+        res.json({ qr: lastQrDataUrl, status: "qr" })
+    } else {
+        res.json({ qr: null, status: connectionStatus.status })
+    }
 })
 
 app.post("/session/connect", async (req, res) => {
-    if (currentStatus === "connected" || currentStatus === "syncing") {
-        return res.json({ success: true, message: "Já conectado", status: currentStatus })
+    try {
+        // Se já está conectado ou sincronizando
+        if (connectionStatus.status === "connected" || connectionStatus.status === "syncing") {
+            return res.json({ 
+                success: true, 
+                message: "Já conectado",
+                status: connectionStatus.status 
+            });
+        }
+        
+        // Se já está gerando QR
+        if (connectionStatus.status === "qr") {
+            return res.json({ 
+                success: true, 
+                message: "QR Code já disponível",
+                status: "qr"
+            });
+        }
+        
+        // Se já está iniciando
+        if (isStarting) {
+            return res.json({ 
+                success: true, 
+                message: "Conexão em andamento",
+                status: "connecting"
+            });
+        }
+        
+        // ✅ INICIA NOVA CONEXÃO
+        startWhatsApp();
+        res.json({ success: true, message: "Iniciando conexão..." });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
-    
-    if (currentStatus === "qr") {
-        return res.json({ success: true, message: "QR disponível", status: "qr" })
-    }
-    
-    isInitializing = false
-    hasSyncedHistory = false
-    startWhatsApp()
-    
-    res.json({ success: true, message: "Iniciando..." })
-})
+});
 
 app.post("/session/disconnect", async (req, res) => {
     try {
-        isInitializing = false
+        isStarting = false
         hasSyncedHistory = false
         
-        if (sock) await sock.logout()
-        
-        if (fs.existsSync("./auth_info")) {
-            fs.rmSync("./auth_info", { recursive: true, force: true })
-            fs.mkdirSync("./auth_info", { recursive: true })
+        if (sock) {
+            try {
+                await sock.logout();
+            } catch (e) {
+                console.log("[DISCONNECT] Erro no logout:", e.message)
+            }
+            sock.ev.removeAllListeners();
+            sock.end();
+            sock = null;
         }
         
-        await updateStatus("disconnected", null, null)
-        sock = null
+        // Limpa pasta de autenticação
+        if (fs.existsSync("./auth_info")) {
+            fs.rmSync("./auth_info", { recursive: true, force: true });
+            fs.mkdirSync("./auth_info", { recursive: true });
+        }
         
-        res.json({ success: true, message: "Desconectado" })
+        await updateStatus("disconnected", null, null, "Logout manual")
+        
+        res.json({ success: true, message: "Desconectado com sucesso" });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message })
+        res.status(500).json({ success: false, error: error.message });
     }
-})
+});
 
+// PROXY DE AVATAR
 app.get("/chats/avatar/:chatId", async (req, res) => {
     try {
-        if (!sock || currentStatus !== "connected") {
-            return res.status(503).json({ error: "Não conectado" })
+        const { chatId } = req.params;
+        if (!sock || connectionStatus.status !== "connected") {
+            return res.status(503).json({ error: "WhatsApp não conectado" });
         }
-        
-        const url = await sock.profilePictureUrl(req.params.chatId, "image").catch(() => null)
-        if (!url) return res.status(404).json({ error: "Não encontrado" })
-        
-        const response = await fetch(url)
-        res.set("Content-Type", response.headers.get("content-type") || "image/jpeg")
-        res.set("Cache-Control", "public, max-age=86400")
-        res.send(Buffer.from(await response.arrayBuffer()))
+        const url = await sock.profilePictureUrl(chatId, "image").catch(() => null);
+        if (!url) {
+            return res.status(404).json({ error: "Avatar não encontrado" });
+        }
+        const response = await fetch(url);
+        const buffer = await response.arrayBuffer();
+        res.set("Content-Type", response.headers.get("content-type") || "image/jpeg");
+        res.set("Cache-Control", "public, max-age=86400");
+        res.send(Buffer.from(buffer));
     } catch (error) {
-        res.status(500).json({ error: error.message })
+        res.status(500).json({ error: error.message });
     }
-})
+});
 
 app.get("/chats", async (req, res) => {
     try {
         const { data, error } = await supabase
             .from("chats")
             .select("*")
-            .order("last_message_time", { ascending: false })
-        
-        if (error) throw error
-        res.json(data)
+            .order("last_message_time", { ascending: false });
+        if (error) throw error;
+        res.json(data);
     } catch (error) {
-        res.status(500).json({ error: error.message })
+        res.status(500).json({ error: error.message });
     }
-})
+});
 
 app.get("/chats/:chatId/messages", async (req, res) => {
     try {
-        const { chatId } = req.params
-        const { limit = 50, before } = req.query
+        const { chatId } = req.params;
+        const { limit = 50, before } = req.query;
         
         let query = supabase
             .from("messages")
             .select("*")
             .eq("chat_id", chatId)
             .order("timestamp", { ascending: false })
-            .limit(Number(limit))
+            .limit(Number(limit));
         
-        if (before) query = query.lt("timestamp", Number(before))
+        if (before) {
+            query = query.lt("timestamp", Number(before));
+        }
         
-        const { data, error } = await query
-        if (error) throw error
-        res.json(data)
+        const { data, error } = await query;
+        if (error) throw error;
+        res.json(data);
     } catch (error) {
-        res.status(500).json({ error: error.message })
+        res.status(500).json({ error: error.message });
     }
-})
+});
 
 app.get("/media/:chatId/:messageId", async (req, res) => {
     try {
-        if (!sock || currentStatus !== "connected") {
-            return res.status(503).json({ error: "Não conectado" })
+        const { chatId, messageId } = req.params;
+        
+        if (!sock || connectionStatus.status !== "connected") {
+            return res.status(503).json({ error: "WhatsApp não conectado" });
         }
         
-        const msg = await sock.loadMessage(req.params.chatId, req.params.messageId)
-        if (!msg) return res.status(404).json({ error: "Não encontrada" })
+        const msg = await sock.loadMessage(chatId, messageId);
+        if (!msg) {
+            return res.status(404).json({ error: "Mensagem não encontrada" });
+        }
         
-        const buffer = await downloadMediaMessage(msg, "buffer", {})
-        const media = msg.message?.imageMessage || msg.message?.videoMessage || 
-                      msg.message?.audioMessage || msg.message?.documentMessage
+        const buffer = await downloadMediaMessage(msg, "buffer", {});
+        const mediaMsg = msg.message?.imageMessage || msg.message?.videoMessage || 
+                         msg.message?.audioMessage || msg.message?.documentMessage;
         
-        res.set("Content-Type", media?.mimetype || "application/octet-stream")
-        res.set("Cache-Control", "public, max-age=86400")
-        res.send(buffer)
+        res.set("Content-Type", mediaMsg?.mimetype || "application/octet-stream");
+        res.set("Cache-Control", "public, max-age=86400");
+        res.send(buffer);
     } catch (error) {
-        res.status(500).json({ error: error.message })
+        res.status(500).json({ error: error.message });
     }
-})
+});
 
 app.post("/chats/send", async (req, res) => {
     try {
-        const { chatId, message } = req.body
+        const { chatId, message } = req.body;
         
-        if (!sock || currentStatus !== "connected") {
-            return res.status(503).json({ error: "Não conectado" })
+        if (!sock || connectionStatus.status !== "connected") {
+            return res.status(503).json({ error: "WhatsApp não conectado" });
         }
         
         if (!chatId || !message) {
-            return res.status(400).json({ error: "chatId e message obrigatórios" })
+            return res.status(400).json({ error: "chatId e message são obrigatórios" });
         }
         
-        const result = await sock.sendMessage(chatId, { text: message })
-        res.json({ success: true, messageId: result.key.id })
+        const result = await sock.sendMessage(chatId, { text: message });
+        res.json({ success: true, messageId: result.key.id });
     } catch (error) {
-        res.status(500).json({ error: error.message })
+        res.status(500).json({ error: error.message });
     }
-})
+});
 
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => console.log(`[SERVER] 🌐 Porta ${PORT}`))
