@@ -179,11 +179,14 @@ async function startWhatsApp(isManualStart = false) {
 
     // --- SINCRONIZAÇÃO EM LOTES (PIPELINE) ---
     sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest }) => {
-        // ✅ EVITA MÚLTIPLAS SINCRONIZAÇÕES
+        // ✅ EVITA MÚLTIPLAS SINCRONIZAÇÕES - VERIFICAÇÃO NO INÍCIO
         if (hasSyncedHistory) {
             console.log(`[SYNC] ⏭️ Ignorando sync adicional (já sincronizado). Recebido: ${messages.length} msgs.`)
             return
         }
+
+        // ✅ MARCA IMEDIATAMENTE para evitar race conditions
+        hasSyncedHistory = true
 
         console.log(`[SYNC] 🌊 Recebido: ${chats.length} chats, ${messages.length} msgs. isLatest: ${isLatest}`)
         if (qrTimeout) clearTimeout(qrTimeout);
@@ -225,7 +228,6 @@ async function startWhatsApp(isManualStart = false) {
                     is_group: false,
                     is_archived: c.archived || false,
                     last_message_time: timestamp, 
-                    // ✅ REMOVIDO: last_message - será preenchido pelo Trigger do banco
                 };
             });
 
@@ -264,9 +266,6 @@ async function startWhatsApp(isManualStart = false) {
 
             await new Promise(r => setTimeout(r, 200)); 
         }
-        
-        // ✅ MARCA QUE JÁ SINCRONIZOU
-        hasSyncedHistory = true
         
         // ✅ ATUALIZA STATUS PARA CONNECTED
         await updateStatusInDb("connected", null, sock?.user?.id)
