@@ -495,7 +495,7 @@ function getContactName(chatId, chatName, pushName) {
 // 💾 FUNÇÃO PARA SALVAR/ATUALIZAR CHAT NO BANCO
 // ============================================================
 async function upsertChat(chatData, metadata = {}) {
-    const { id, unread_count, is_group, is_archived, last_message_time, last_message } = chatData
+    const { id, unread_count, is_group, is_archived, last_message_time } = chatData
     
     // Extrai telefone apenas de IDs permanentes
     const telefone = extractPhoneFromChatId(id)
@@ -535,10 +535,6 @@ async function upsertChat(chatData, metadata = {}) {
     // Adiciona telefone se disponível (apenas para IDs permanentes)
     if (telefone) {
         chatRecord.phone = telefone
-    }
-    
-    if (last_message) {
-        chatRecord.last_message = last_message
     }
     
     // Para @lid, salva metadados para matching futuro
@@ -880,13 +876,11 @@ async function startWhatsApp() {
                         is_group: false,
                         is_archived: false,
                         last_message_time: Number(msg.messageTimestamp) * 1000,
-                        last_message: getMessageText(msg),
                     }, msgMetadata) // Passa metadados para matching futuro
                 } else {
-                    // Atualiza último timestamp e mensagem
+                    // Atualiza último timestamp
                     const updateData = {
                         last_message_time: Number(msg.messageTimestamp) * 1000,
-                        last_message: getMessageText(msg),
                         unread_count: msg.key.fromMe ? 0 : (chatData.unread_count || 0) + 1
                     }
                     
