@@ -164,8 +164,8 @@ async function findChatByPhone(telefone) {
     try {
         const { data, error } = await supabase
             .from("chats")
-            .select("id, uuid, name, telefone, is_lid, push_name, lid_metadata")
-            .or(`telefone.eq.${telefone},id.like.${telefone}@%`)
+            .select("id, uuid, name, phone, is_lid, push_name, lid_metadata")
+            .or(`phone.eq.${telefone},id.like.${telefone}@%`)
             .limit(1)
             .single()
         
@@ -311,7 +311,7 @@ async function mergeLidToPermanent(lidId, permanentId, telefone, newMetadata = {
             .from("chats")
             .update({ 
                 id: permanentId,
-                telefone: telefone,
+                phone: telefone,
                 is_lid: false,
                 original_lid_id: lidId,
                 lid_metadata: updatedMetadata
@@ -459,7 +459,7 @@ function prepareMessageForDB(msg, chatId, chatUuid = null) {
     const messageData = {
         id: msg.key.id,
         chat_id: chatId,
-        sender: msg.key.fromMe ? "me" : (msg.key.participant || chatId),
+        sender_id: msg.key.fromMe ? "me" : (msg.key.participant || chatId),
         content: getMessageText(msg),
         timestamp: Number(msg.messageTimestamp) * 1000,
         from_me: msg.key.fromMe || false,
@@ -534,7 +534,7 @@ async function upsertChat(chatData, metadata = {}) {
     
     // Adiciona telefone se disponível (apenas para IDs permanentes)
     if (telefone) {
-        chatRecord.telefone = telefone
+        chatRecord.phone = telefone
     }
     
     if (last_message) {
@@ -559,7 +559,7 @@ async function upsertChat(chatData, metadata = {}) {
             // Extrai só o número do formato 5511999999999@s.whatsapp.net
             const phoneFromMetadata = senderPhone.split("@")[0]
             if (phoneFromMetadata) {
-                chatRecord.telefone = phoneFromMetadata
+                chatRecord.phone = phoneFromMetadata
             }
         }
     }
@@ -746,7 +746,7 @@ async function startWhatsApp() {
                 
                 // Adiciona telefone se disponível
                 if (telefone) {
-                    chatRecord.telefone = telefone
+                    chatRecord.phone = telefone
                 }
                 
                 // Para @lid, salva metadados
@@ -955,7 +955,7 @@ async function startWhatsApp() {
                     await supabase
                         .from("chats")
                         .update({
-                            telefone: contactMetadata.phoneNumber.split("@")[0],
+                            phone: contactMetadata.phoneNumber.split("@")[0],
                             lid_metadata: supabase.raw(`COALESCE(lid_metadata, '{}'::jsonb) || '${JSON.stringify(contactMetadata)}'::jsonb`)
                         })
                         .eq("id", contactId)
