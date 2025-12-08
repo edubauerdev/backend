@@ -15,6 +15,67 @@ const {
 const qrcode = require("qrcode")
 const fs = require('fs')
 
+// ============================================================
+// 🧹 SMART CLEAN - SISTEMA DE LIMPEZA INTELIGENTE
+// ============================================================
+// 
+// Este backend implementa um sistema de SMART CLEAN que é executado
+// automaticamente quando o WhatsApp é desconectado.
+//
+// 🎯 OBJETIVO:
+// - Limpar dados temporários da sessão WhatsApp
+// - Preservar dados importantes definidos pelo usuário
+// - Permitir reconexão sem duplicidade de dados
+//
+// 📋 ESTRATÉGIA:
+//
+// 1. TABELA MESSAGES (100% deletada):
+//    ❌ Todas as mensagens são deletadas
+//    ✅ Serão sincronizadas novamente na próxima conexão
+//
+// 2. TABELA CHATS (limpeza seletiva):
+//    
+//    ✅ PRESERVADO (dados permanentes do usuário):
+//       - uuid (identificador único PERMANENTE)
+//       - name (nome customizado pelo usuário)
+//       - image_url (foto customizada)
+//       - etiqueta_ids (tags/categorias)
+//       - created_at, updated_at
+//       - Relacionamentos (notes, assignments, etc)
+//    
+//    🧹 LIMPO (dados temporários da sessão):
+//       - id (chat_id do WhatsApp)
+//       - phone (número de telefone)
+//       - push_name (nome do contato no WhatsApp)
+//       - verified_name (nome verificado)
+//       - is_lid, is_group, is_archived (flags)
+//       - unread_count (contador)
+//       - last_message_time (timestamp)
+//       - lid_metadata, original_lid_id (metadados)
+//
+// 🔄 RECONEXÃO:
+//
+// CENÁRIO 1 - MESMO NÚMERO:
+//   - UUID permanece o mesmo
+//   - Dados do usuário (name, etiquetas) são mantidos
+//   - ID WhatsApp é repopulado
+//   - Mensagens são sincronizadas novamente
+//   - Tudo "casa" perfeitamente pelo UUID
+//
+// CENÁRIO 2 - NÚMERO DIFERENTE:
+//   - IDs WhatsApp zerados evitam conflitos
+//   - Não há duplicidade de chats
+//   - Cada número gera novos chats
+//   - Dados antigos ficam órfãos (podem ser limpos posteriormente)
+//
+// 🚀 ACIONAMENTO:
+//   - Automático: ao desconectar (logout)
+//   - Automático: em desconexões permanentes
+//   - Manual: rota POST /session/smart-clean
+//   - Manual: durante o /session/disconnect
+//
+// ============================================================
+
 const app = express()
 app.use(cors())
 app.use(express.json({ limit: '50mb' }))
@@ -376,6 +437,168 @@ async function tryMatchPermanentToLid(permanentId, msgMetadata = {}) {
 }
 
 // ============================================================
+// 🧹 SMART CLEAN - LIMPEZA INTELIGENTE DO BANCO DE DADOS
+// ============================================================
+/**
+ * SMART CLEAN - Limpa dados temporários da sessão do WhatsApp
+ * preservando informações importantes para reconexão
+ * 
+ * ESTRATÉGIA:
+ * 1. DELETA todas as mensagens (dados voláteis)
+ * 2. Limpa dados temporários dos chats (phone, push_name, etc)
+ * 3. PRESERVA dados essenciais (uuid, name, etiquetas, image_url, etc)
+ * 
+ * OBJETIVO:
+ * - Reconexão com MESMO número: dados "casam" pelo UUID
+ * - Reconexão com OUTRO número: sem duplicidade (IDs WhatsApp zerados)
+ * 
+ * TABELA CHATS - O QUE É LIMPO VS PRESERVADO:
+ * ✅ PRESERVADO (dados permanentes do usuário):
+ *    - uuid (identificador único PERMANENTE)
+ *    - name (nome definido pelo usuário)
+ *    - image_url (foto do chat)
+ *    - etiqueta_ids (tags/categorias)
+ *    - created_at, updated_at
+ *    - Todos os campos de relacionamento (chat_notes, chat_assignments, etc)
+ * 
+ * 🧹 LIMPO (dados temporários da sessão WhatsApp):
+ *    - id (chat_id do WhatsApp - será repopulado na reconexão)
+ *    - phone (telefone - será repopulado)
+ *    - push_name (nome do WhatsApp - será repopulado)
+ *    - verified_name (nome verificado - será repopulado)
+ *    - is_lid, is_group, is_archived (flags de estado)
+ *    - unread_count (contador temporário)
+ *    - last_message_time (timestamp - será repopulado)
+ *    - lid_metadata, original_lid_id (metadados de sessão)
+ * 
+ * TABELA MESSAGES - TUDO É DELETADO:
+ *    As mensagens são dados voláteis que serão sincronizados novamente
+ */
+async function smartCleanWhatsAppData() {
+    try {
+        console.log("[SMART CLEAN] 🧹 Iniciando limpeza inteligente do banco...")
+        console.log("[SMART CLEAN] 📋 Estratégia:")
+        console.log("  ✅ PRESERVA: uuid, name, etiquetas, image_url")
+        console.log("  🧹 LIMPA: id, phone, mensagens, metadados temporários")
+        
+        const stats = {
+            messages_deleted: 0,
+            chats_cleaned: 0,
+            chats_preserved: 0
+        }
+        
+        // ============================================================
+        // FASE 1: DELETAR TODAS AS MENSAGENS
+        // ============================================================
+        console.log("[SMART CLEAN] 📝 FASE 1: Deletando mensagens...")
+        
+        const { error: msgError, count: msgCount } = await supabase
+            .from("messages")
+            .delete()
+            .neq('id', '') // Deleta tudo (todas as mensagens)
+        
+        if (msgError) {
+            console.error("[SMART CLEAN] ❌ Erro ao deletar mensagens:", msgError.message)
+        } else {
+            stats.messages_deleted = msgCount || 0
+            console.log(`[SMART CLEAN] ✅ ${stats.messages_deleted} mensagens deletadas`)
+        }
+        
+        // ============================================================
+        // FASE 2: LIMPAR DADOS TEMPORÁRIOS DOS CHATS
+        // ============================================================
+        console.log("[SMART CLEAN] 💬 FASE 2: Limpando dados temporários dos chats...")
+        
+        const { error: chatError, count: chatCount } = await supabase
+            .from("chats")
+            .update({
+                // 🧹 LIMPA identificadores temporários do WhatsApp
+                id: null,              // Chat ID será repopulado na reconexão
+                phone: null,           // Telefone será extraído novamente
+                push_name: null,       // Push name virá do WhatsApp novamente
+                verified_name: null,   // Nome verificado será sincronizado
+                
+                // 🧹 RESETA flags de estado temporário
+                is_lid: false,
+                is_group: false,
+                is_archived: false,
+                unread_count: 0,
+                
+                // 🧹 LIMPA timestamps e metadados de sessão
+                last_message_time: null,
+                lid_metadata: null,
+                original_lid_id: null,
+                
+                // ✅ PRESERVA AUTOMATICAMENTE (não mencionados):
+                // - uuid (PK, nunca muda)
+                // - name (definido pelo usuário)
+                // - image_url (foto do chat)
+                // - etiqueta_ids (tags do usuário)
+                // - created_at, updated_at
+                // - Todos os relacionamentos
+            })
+            .neq('uuid', '') // Atualiza todos os chats
+        
+        if (chatError) {
+            console.error("[SMART CLEAN] ❌ Erro ao limpar chats:", chatError.message)
+        } else {
+            stats.chats_cleaned = chatCount || 0
+            console.log(`[SMART CLEAN] ✅ ${stats.chats_cleaned} chats limpos`)
+        }
+        
+        // ============================================================
+        // FASE 3: CONTAR CHATS PRESERVADOS (com dados do usuário)
+        // ============================================================
+        const { count: preservedCount } = await supabase
+            .from("chats")
+            .select('*', { count: 'exact', head: true })
+            .or('name.not.is.null,etiqueta_ids.not.is.null,image_url.not.is.null')
+        
+        stats.chats_preserved = preservedCount || 0
+        
+        // ============================================================
+        // FASE 4: RESETAR CONFIGURAÇÕES DA INSTÂNCIA
+        // ============================================================
+        console.log("[SMART CLEAN] ⚙️ FASE 4: Resetando configurações da instância...")
+        
+        await supabase
+            .from("instance_settings")
+            .update({
+                status: 'disconnected',
+                qr_code: null,
+                phone: null,
+            })
+            .eq('id', 1)
+        
+        // ============================================================
+        // RELATÓRIO FINAL
+        // ============================================================
+        console.log("\n[SMART CLEAN] ✅ LIMPEZA COMPLETA!")
+        console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        console.log(`📝 Mensagens deletadas:      ${stats.messages_deleted}`)
+        console.log(`💬 Chats limpos:             ${stats.chats_cleaned}`)
+        console.log(`✅ Chats com dados do usuário: ${stats.chats_preserved}`)
+        console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        console.log("💡 Próxima conexão:")
+        console.log("   • MESMO número → dados casam pelo UUID")
+        console.log("   • OUTRO número → sem duplicidade (IDs zerados)")
+        console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+        
+        return {
+            success: true,
+            ...stats
+        }
+        
+    } catch (error) {
+        console.error("[SMART CLEAN] ❌ Erro geral:", error.message)
+        return {
+            success: false,
+            error: error.message
+        }
+    }
+}
+
+// ============================================================
 // 📡 FUNÇÃO DE ATUALIZAÇÃO DE STATUS - TEMPO REAL
 // ============================================================
 async function updateStatus(newStatus, qrCode = null, phone = null, extraInfo = null) {
@@ -658,11 +881,21 @@ async function startWhatsApp() {
                 await updateStatus("disconnected", null, null, `Razão: ${reason}`)
 
                 const hasSession = fs.existsSync("./auth_info/creds.json");
-                if (statusCode !== DisconnectReason.loggedOut && hasSession) {
+                
+                // 🧹 SMART CLEAN em caso de logout ou desconexão permanente
+                if (statusCode === DisconnectReason.loggedOut || !hasSession) {
+                    console.log("[WHATSAPP] 🧹 Desconexão permanente detectada. Executando Smart Clean...")
+                    const cleanupResult = await smartCleanWhatsAppData()
+                    
+                    if (cleanupResult.success) {
+                        console.log("[WHATSAPP] ✅ Smart Clean concluído após desconexão")
+                    }
+                    
+                    sock = null
+                } else {
+                    // Reconexão temporária - não limpa o banco
                     console.log("[WHATSAPP] 🔄 Reconectando em 5 segundos...");
                     setTimeout(() => startWhatsApp(), 5000)
-                } else {
-                    sock = null
                 }
             }
         })
@@ -1101,7 +1334,45 @@ app.post("/session/disconnect", async (req, res) => {
         
         await updateStatus("disconnected", null, null, "Logout manual")
         
-        res.json({ success: true, message: "Desconectado com sucesso" });
+        // 🧹 EXECUTA SMART CLEAN DO BANCO
+        console.log("[DISCONNECT] 🧹 Executando Smart Clean do banco de dados...")
+        const cleanupResult = await smartCleanWhatsAppData()
+        
+        if (cleanupResult.success) {
+            console.log(`[DISCONNECT] ✅ Smart Clean concluído!`)
+        } else {
+            console.error(`[DISCONNECT] ❌ Erro no Smart Clean:`, cleanupResult.error)
+        }
+        
+        res.json({ 
+            success: true, 
+            message: "Desconectado com sucesso",
+            cleanup: cleanupResult
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// 🧹 ROTA PARA EXECUTAR SMART CLEAN MANUALMENTE
+app.post("/session/smart-clean", async (req, res) => {
+    try {
+        // Verifica se está conectado
+        if (connectionStatus.status === "connected" || connectionStatus.status === "syncing") {
+            return res.status(400).json({ 
+                success: false, 
+                error: "Não é possível executar Smart Clean enquanto conectado. Desconecte primeiro." 
+            });
+        }
+        
+        console.log("[API] 🧹 Smart Clean solicitado via API...")
+        const cleanupResult = await smartCleanWhatsAppData()
+        
+        res.json({ 
+            success: cleanupResult.success,
+            message: cleanupResult.success ? "Smart Clean executado com sucesso" : "Erro ao executar Smart Clean",
+            stats: cleanupResult
+        });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
