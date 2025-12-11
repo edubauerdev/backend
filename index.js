@@ -541,7 +541,9 @@ async function startWhatsApp() {
             });
 
             const chatUuidMap = new Map()
-            const allChatRecords = []
+            
+            // 🔧 CORREÇÃO: Deduplicar chats usando Map (último valor prevalece)
+            const chatRecordsMap = new Map()
 
             for (const c of privateChats) {
                 let timestamp = c.conversationTimestamp ? Number(c.conversationTimestamp) : 0;
@@ -563,11 +565,26 @@ async function startWhatsApp() {
                     if (chatMetadata.pushName) chatRecord.push_name = chatMetadata.pushName
                     if (chatMetadata.notify) chatRecord.push_name = chatRecord.push_name || chatMetadata.notify
                 }
-                allChatRecords.push(chatRecord)
+                
+                // 🔧 Se já existe, mesclar dados (preservar o mais recente)
+                if (chatRecordsMap.has(c.id)) {
+                    const existing = chatRecordsMap.get(c.id)
+                    // Manter o timestamp mais recente
+                    if (timestamp > (existing.last_message_time || 0)) {
+                        chatRecordsMap.set(c.id, { ...existing, ...chatRecord })
+                    } else {
+                        chatRecordsMap.set(c.id, { ...chatRecord, ...existing })
+                    }
+                } else {
+                    chatRecordsMap.set(c.id, chatRecord)
+                }
             }
+            
+            // Converter Map para Array (sem duplicatas)
+            const allChatRecords = Array.from(chatRecordsMap.values())
 
             if (allChatRecords.length > 0) {
-                console.log(`[SYNC] 📦 Processando ${allChatRecords.length} chats deste chunk...`)
+                console.log(`[SYNC] 📦 Processando ${allChatRecords.length} chats únicos deste chunk...`)
                 const CHAT_BATCH_SIZE = 50
                 
                 for (let i = 0; i < allChatRecords.length; i += CHAT_BATCH_SIZE) {
@@ -580,16 +597,22 @@ async function startWhatsApp() {
                 }
             }
 
-            // FASE 2: MENSAGENS
+            // FASE 2: MENSAGENS - Também deduplicar
             if (privateMessages.length > 0) {
                 const MSG_BATCH_SIZE = 50
                 console.log(`[DB] 💾 Processando ${privateMessages.length} mensagens deste chunk...`)
                 
-                for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
-                    let batch = privateMessages.slice(i, i + MSG_BATCH_SIZE).map(m => {
-                        const chatId = m.key.remoteJid
-                        return prepareMessageForDB(m, chatId, chatUuidMap.get(chatId) || null)
-                    });
+                // 🔧 Deduplicar mensagens por ID
+                const messagesMap = new Map()
+                for (const m of privateMessages) {
+                    const chatId = m.key.remoteJid
+                    const msgData = prepareMessageForDB(m, chatId, chatUuidMap.get(chatId) || null)
+                    messagesMap.set(m.key.id, msgData) // ID único da mensagem
+                }
+                const uniqueMessages = Array.from(messagesMap.values())
+                
+                for (let i = 0; i < uniqueMessages.length; i += MSG_BATCH_SIZE) {
+                    let batch = uniqueMessages.slice(i, i + MSG_BATCH_SIZE)
                     
                     const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' })
                     if (error) console.error(`[DB] ❌ Erro em mensagens ${i}:`, error.message)
@@ -605,6 +628,8 @@ async function startWhatsApp() {
             if (isLatest) {
                 console.log(`[SYNC] ✅ TODOS OS PACOTES RECEBIDOS. SYNC COMPLETO.`)
                 hasSyncedHistory = true
+                // 🔧 Limpar contactStore após sync para liberar memória
+                contactStore = {}
                 await updateStatus("connected", null, sock?.user?.id, "Sincronização completa")
             } else {
                 console.log(`[SYNC] ⏳ Aguardando mais pacotes...`)
