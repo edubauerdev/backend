@@ -511,16 +511,14 @@ async function startWhatsApp() {
         })
 
         // ============================================================
-        // 📚 EVENTO: SYNC DE HISTÓRICO (LOW-END OPTIMIZED)
+        // 📚 EVENTO: SYNC DE HISTÓRICO (CORRIGIDO PARA CHUNKS)
         // ============================================================
         sock.ev.on("messaging-history.set", async ({ chats, contacts, messages, isLatest }) => {
-            if (hasSyncedHistory) {
-                console.log(`[SYNC] ⏭️ Ignorando sync adicional. Recebido: ${messages.length} msgs.`)
-                return
-            }
-            hasSyncedHistory = true
-            console.log(`[SYNC] 📚 Recebido: ${chats.length} chats, ${messages.length} msgs.`)
-            console.log(`[MEMORY] 💾 Uso antes da sync: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`)
+            // CORREÇÃO: Removemos o return antecipado. Processamos cada chunk (pacote) de dados.
+            // O WhatsApp envia em várias partes. Se retornarmos na primeira, perdemos o resto.
+            
+            console.log(`[SYNC] 📚 Chunk recebido: ${chats.length} chats, ${messages.length} msgs. isLatest: ${isLatest}`)
+            console.log(`[MEMORY] 💾 Uso atual: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`)
             
             if (qrTimeout) clearTimeout(qrTimeout);
             if (contacts) contacts.forEach(c => { if (c.name) contactStore[c.id] = c.name })
@@ -534,8 +532,7 @@ async function startWhatsApp() {
             // ⏰ FILTRO DE 6 MESES
             const SIX_MONTHS_MS = 6 * 30 * 24 * 60 * 60 * 1000
             const cutoffTimestamp = Date.now() - SIX_MONTHS_MS
-            console.log(`[SYNC] ⏰ Filtro: Mensagens após ${new Date(cutoffTimestamp).toLocaleDateString('pt-BR')}`)
-
+            
             const privateChats = chats.filter(c => !c.id.includes("@g.us"));
             const privateMessages = messages.filter(m => {
                 if (!m.key.remoteJid || m.key.remoteJid.includes("@g.us")) return false
@@ -543,7 +540,6 @@ async function startWhatsApp() {
                 return msgTimestamp >= cutoffTimestamp
             });
 
-            console.log(`[SYNC] 🗑️ ${messages.length - privateMessages.length} mensagens antigas filtradas (economia de RAM)`)
             const chatUuidMap = new Map()
             const allChatRecords = []
 
@@ -570,50 +566,50 @@ async function startWhatsApp() {
                 allChatRecords.push(chatRecord)
             }
 
-            console.log(`[SYNC] 📦 ${allChatRecords.length} chats preparados`)
-            const CHAT_BATCH_SIZE = 50
-            
-            for (let i = 0; i < allChatRecords.length; i += CHAT_BATCH_SIZE) {
-                const batch = allChatRecords.slice(i, i + CHAT_BATCH_SIZE)
-                const { data: insertedChats, error } = await supabase.from("chats").upsert(batch, { onConflict: 'id', ignoreDuplicates: false }).select('id, uuid')
-                if (error) console.error(`[DB] ❌ Erro ao salvar chats ${i}:`, error.message)
-                else if (insertedChats) insertedChats.forEach(chat => { if (chat.uuid) chatUuidMap.set(chat.id, chat.uuid) })
+            if (allChatRecords.length > 0) {
+                console.log(`[SYNC] 📦 Processando ${allChatRecords.length} chats deste chunk...`)
+                const CHAT_BATCH_SIZE = 50
                 
-                const percent = Math.round(((i + batch.length) / allChatRecords.length) * 100)
-                console.log(`[DB] ✅ Chats: ${percent}%`)
-                
-                await new Promise(r => setTimeout(r, 100));
-                if (global.gc && i % 100 === 0) { global.gc(); console.log(`[MEMORY] 🧹 GC executado no lote ${i}`) }
-            }
-            console.log(`[SYNC] ✅ FASE 1 COMPLETA: ${chatUuidMap.size} chats salvos`)
-
-            // FASE 2: MENSAGENS (COM GC AGRESSIVO)
-            const MSG_BATCH_SIZE = 50
-            console.log(`[DB] 💾 Iniciando inserção de ${privateMessages.length} mensagens...`)
-            
-            for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
-                let batch = privateMessages.slice(i, i + MSG_BATCH_SIZE).map(m => {
-                    const chatId = m.key.remoteJid
-                    return prepareMessageForDB(m, chatId, chatUuidMap.get(chatId) || null)
-                });
-                
-                const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' })
-                if (error) console.error(`[DB] ❌ Erro em mensagens ${i}:`, error.message)
-                
-                if ((i / MSG_BATCH_SIZE) % 10 === 0 && i > 0) {
-                    const percent = Math.round((i / privateMessages.length) * 100)
-                    console.log(`[DB] ✅ Mensagens: ${percent}%`)
-                    console.log(`[MEMORY] 💾 Uso atual: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`)
+                for (let i = 0; i < allChatRecords.length; i += CHAT_BATCH_SIZE) {
+                    const batch = allChatRecords.slice(i, i + CHAT_BATCH_SIZE)
+                    const { data: insertedChats, error } = await supabase.from("chats").upsert(batch, { onConflict: 'id', ignoreDuplicates: false }).select('id, uuid')
+                    if (error) console.error(`[DB] ❌ Erro ao salvar chats ${i}:`, error.message)
+                    else if (insertedChats) insertedChats.forEach(chat => { if (chat.uuid) chatUuidMap.set(chat.id, chat.uuid) })
+                    
+                    await new Promise(r => setTimeout(r, 50)); // Pequeno delay para respirar
                 }
-                
-                batch = null;
-                if (global.gc && i % 200 === 0) { global.gc(); console.log(`[MEMORY] 🧹 GC forçado no lote ${i}`) }
-                await new Promise(r => setTimeout(r, 150));
             }
 
-            console.log(`[SYNC] ✅ FASE 2 COMPLETA.`)
-            console.log(`[MEMORY] 💾 Uso final: ${Math.round(process.memoryUsage().heapUsed / 1024 / 1024)}MB`)
-            await updateStatus("connected", null, sock?.user?.id, "Sincronização completa")
+            // FASE 2: MENSAGENS
+            if (privateMessages.length > 0) {
+                const MSG_BATCH_SIZE = 50
+                console.log(`[DB] 💾 Processando ${privateMessages.length} mensagens deste chunk...`)
+                
+                for (let i = 0; i < privateMessages.length; i += MSG_BATCH_SIZE) {
+                    let batch = privateMessages.slice(i, i + MSG_BATCH_SIZE).map(m => {
+                        const chatId = m.key.remoteJid
+                        return prepareMessageForDB(m, chatId, chatUuidMap.get(chatId) || null)
+                    });
+                    
+                    const { error } = await supabase.from("messages").upsert(batch, { onConflict: 'id' })
+                    if (error) console.error(`[DB] ❌ Erro em mensagens ${i}:`, error.message)
+                    
+                    batch = null;
+                    if (global.gc && i % 200 === 0) { global.gc(); }
+                    await new Promise(r => setTimeout(r, 100));
+                }
+            }
+
+            // AQUI ESTÁ A CORREÇÃO PRINCIPAL:
+            // Só marcamos como sincronizado (connected) se for o último chunk (isLatest).
+            if (isLatest) {
+                console.log(`[SYNC] ✅ TODOS OS PACOTES RECEBIDOS. SYNC COMPLETO.`)
+                hasSyncedHistory = true
+                await updateStatus("connected", null, sock?.user?.id, "Sincronização completa")
+            } else {
+                console.log(`[SYNC] ⏳ Aguardando mais pacotes...`)
+            }
+            
             if (global.gc) global.gc()
         })
 
