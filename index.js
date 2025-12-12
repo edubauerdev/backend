@@ -54,6 +54,7 @@ let lastQrDataUrl = null
 let qrTimeout = null
 let hasSyncedHistory = false
 let isStarting = false
+let syncTimeout = null // ⏰ Timeout para detectar fim de sync
 
 const connectionStatus = {
     connected: false,
@@ -63,6 +64,9 @@ const connectionStatus = {
 
 // Cache de contatos (apenas para referência, NÃO usamos para nome do chat)
 let contactStore = {}
+
+// ⏰ CONFIGURAÇÃO DE TIMEOUT DE SYNC
+const SYNC_IDLE_TIMEOUT_MS = 10000 // 10 segundos sem novos chunks = sync completo
 
 // GARANTE QUE A PASTA DE SESSÃO EXISTE
 if (!fs.existsSync('./auth_info')) {
@@ -448,6 +452,7 @@ async function startWhatsApp() {
     if (isStarting) { console.log("[START] ⚠️ Já existe uma inicialização em andamento..."); return; }
     isStarting = true
     hasSyncedHistory = false
+    if (syncTimeout) { clearTimeout(syncTimeout); syncTimeout = null; } // Limpar timeout pendente
     console.log("[WHATSAPP] 🚀 Iniciando conexão...");
     
     if (sock) {
@@ -497,6 +502,7 @@ async function startWhatsApp() {
                 lastQrDataUrl = null
                 hasSyncedHistory = false
                 isStarting = false
+                if (syncTimeout) { clearTimeout(syncTimeout); syncTimeout = null; } // Limpar timeout pendente
                 await updateStatus("disconnected", null, null, `Razão: ${reason}`)
                 const hasSession = fs.existsSync("./auth_info/creds.json");
                 if (statusCode === DisconnectReason.loggedOut || !hasSession) {
@@ -623,16 +629,40 @@ async function startWhatsApp() {
                 }
             }
 
-            // AQUI ESTÁ A CORREÇÃO PRINCIPAL:
-            // Só marcamos como sincronizado (connected) se for o último chunk (isLatest).
-            if (isLatest) {
-                console.log(`[SYNC] ✅ TODOS OS PACOTES RECEBIDOS. SYNC COMPLETO.`)
+            // ============================================================
+            // 🔧 CORREÇÃO: DETECÇÃO DE FIM DE SYNC COM TIMEOUT
+            // ============================================================
+            // O Baileys NEM SEMPRE envia isLatest: true (bug conhecido).
+            // Solução: usar timeout de inatividade como fallback.
+            // Se não recebermos novos chunks em 10s, finalizamos.
+            // ============================================================
+
+            // Função para finalizar a sincronização
+            const finalizarSync = async () => {
+                if (hasSyncedHistory) return // Já finalizado
+                
+                console.log(`[SYNC] ✅ SYNC COMPLETO (timeout ou isLatest)`)
                 hasSyncedHistory = true
-                // 🔧 Limpar contactStore após sync para liberar memória
-                contactStore = {}
+                contactStore = {} // Liberar memória
+                syncTimeout = null
                 await updateStatus("connected", null, sock?.user?.id, "Sincronização completa")
+                if (global.gc) global.gc()
+            }
+
+            // Se isLatest veio true, finaliza imediatamente
+            if (isLatest) {
+                if (syncTimeout) clearTimeout(syncTimeout)
+                await finalizarSync()
             } else {
-                console.log(`[SYNC] ⏳ Aguardando mais pacotes...`)
+                // Se não é o último, resetar o timeout
+                // Se não vier mais chunks em 10s, assumimos que acabou
+                if (syncTimeout) clearTimeout(syncTimeout)
+                syncTimeout = setTimeout(async () => {
+                    console.log(`[SYNC] ⏰ Timeout de ${SYNC_IDLE_TIMEOUT_MS/1000}s atingido. Finalizando sync...`)
+                    await finalizarSync()
+                }, SYNC_IDLE_TIMEOUT_MS)
+                
+                console.log(`[SYNC] ⏳ Aguardando mais pacotes... (timeout em ${SYNC_IDLE_TIMEOUT_MS/1000}s)`)
             }
             
             if (global.gc) global.gc()
@@ -751,6 +781,7 @@ app.post("/session/connect", async (req, res) => {
 app.post("/session/disconnect", async (req, res) => {
     try {
         isStarting = false; hasSyncedHistory = false;
+        if (syncTimeout) { clearTimeout(syncTimeout); syncTimeout = null; } // Limpar timeout pendente
         if (sock) { try { await sock.logout(); } catch (e) {} sock.end(); sock = null; }
         if (fs.existsSync("./auth_info")) { fs.rmSync("./auth_info", { recursive: true, force: true }); fs.mkdirSync("./auth_info", { recursive: true }); }
         await updateStatus("disconnected", null, null, "Logout manual")
